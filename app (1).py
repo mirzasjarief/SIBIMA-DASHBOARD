@@ -222,9 +222,12 @@ def apply_balance_filter(df, start_date, end_date, customer_filter=None):
         
         # LOGIKA: (Dalam range tanggal) ATAU (Masa lalu yang belum selesai)
         mask_current = (df['transaction_date'] >= start_dt) & (df['transaction_date'] <= end_dt)
-        mask_outstanding = (df['transaction_date'] < start_dt) & (df['status_description'].isin(status_selesai))
-        
-        df = df[mask_current | mask_outstanding]
+        # Only evaluate outstanding mask if status_description exists
+        if 'status_description' in df.columns:
+            mask_outstanding = (df['transaction_date'] < start_dt) & (df['status_description'].isin(status_selesai))
+            df = df[mask_current | mask_outstanding]
+        else:
+            df = df[mask_current]
         #df = df[mask_current]
 
     # Status filter untuk Balance biasanya lebih fleksibel, 
@@ -252,16 +255,95 @@ if isinstance(selected_date_range, tuple) and len(selected_date_range) == 2:
     df_pr_f = apply_balance_filter(df_pr_expanded, sd, ed, final_selected_customers)
     df_po_f = apply_balance_filter(df_po_expanded, sd, ed, final_selected_customers)
     df_grn_f = apply_balance_filter(df_grn_expanded, sd, ed, final_selected_customers)
+    def _find_col_by_alternatives(df, alternatives):
+        if df is None or df.empty:
+            return None
+        norm = {c: c.strip().lower().replace(' ', '_') for c in df.columns.astype(str)}
+        for alt in alternatives:
+            alt_norm = alt.strip().lower().replace(' ', '_')
+            for orig, n in norm.items():
+                if n == alt_norm:
+                    return orig
+        return None
+
+
+    def ensure_so_columns(df):
+        """Ensure `transaction_number` and `product_id` exist on SO dataframe.
+        Will rename common alternative column names to the expected ones.
+        """
+        if df is None or df.empty:
+            return df
+
+        txn_alt = ['transaction_number', 'transaction_no', 'transaction no', 'transactionnumber', 'trx_number', 'trx', 'transaction']
+        prod_alt = ['product_id', 'product id', 'productid', 'product_code', 'productcode', 'sku', 'item_code', 'item code', 'product']
+
+        rename_map = {}
+        txn_col = _find_col_by_alternatives(df, txn_alt)
+        if txn_col and txn_col != 'transaction_number':
+            rename_map[txn_col] = 'transaction_number'
+
+        prod_col = _find_col_by_alternatives(df, prod_alt)
+        if prod_col and prod_col != 'product_id':
+            rename_map[prod_col] = 'product_id'
+
+        if rename_map:
+            df = df.rename(columns=rename_map)
+        return df
+
+
+    # Apply normalization to frames used below
     df_do_f = apply_balance_filter(df_do_expanded, sd, ed, final_selected_customers)
     df_si_f = apply_balance_filter(df_si_expanded, sd, ed, final_selected_customers)
+
+    # Normalize balance frames: convert numeric-like cols, rename common txn/product alternatives,
+    # and uppercase id fields so later code can rely on consistent names when present.
+    def normalize_balance_frame(df):
+        if df is None or (hasattr(df, 'empty') and df.empty):
+            return df
+
+        # numeric conversions for common numeric-like columns
+        for c in list(df.columns):
+            cn = c.strip().lower().replace(' ', '_')
+            if any(k in cn for k in ('tax1_percentage', 'tax2_percentage', 'discount', 'price', 'quantity', 'total')):
+                df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
+
+        # attempt to find and rename transaction/product columns
+        txn = _find_col_by_alternatives(df, ['transaction_number', 'transaction_no', 'transaction', 'trx_number', 'trx']) or next((c for c in df.columns if 'transaction' in c.lower()), None)
+        prod = _find_col_by_alternatives(df, ['product_id', 'product id', 'productid', 'product_code', 'productcode', 'sku', 'item_code']) or next((c for c in df.columns if any(k in c.lower() for k in ('product','item','sku','code'))), None)
+
+        if txn and txn != 'transaction_number':
+            df = df.rename(columns={txn: 'transaction_number'})
+        if prod and prod != 'product_id':
+            df = df.rename(columns={prod: 'product_id'})
+
+        if 'transaction_number' in df.columns:
+            df['transaction_number'] = df['transaction_number'].astype(str).str.strip().str.upper()
+        if 'product_id' in df.columns:
+            df['product_id'] = df['product_id'].astype(str).str.strip().str.upper()
+
+        return df
+
+    for _n in ('df_so_f','df_pr_f','df_po_f','df_grn_f','df_do_f','df_si_f'):
+        obj = locals().get(_n)
+        if obj is None:
+            continue
+        locals()[_n] = normalize_balance_frame(obj)
 
 
 # --- PROSES PERHITUNGAN (Menggunakan Data Transaksi) ---
 def count_unique_transactions(df):
-    return df['transaction_number'].nunique() if not df.empty else 0
+    if df is None or (hasattr(df, 'empty') and df.empty):
+        return 0
+    # try common transaction column variants
+    for col in ('transaction_number', 'transaction_no', 'transaction', 'trx_number', 'trx'):
+        if col in df.columns:
+            return df[col].nunique()
+    # fallback: no known transaction column
+    print('Warning: no transaction column found in dataframe; available columns:', df.columns.tolist())
+    return 0
 
 total_trans_so = count_unique_transactions(df_so_f)
-total_trans_pr = count_unique_transactions(df_pr_f) 
+total_trans_pr = count_unique_transactions(df_pr_f)
 total_trans_po = count_unique_transactions(df_po_f)
 total_trans_grn = count_unique_transactions(df_grn_f)
 total_trans_do = count_unique_transactions(df_do_f)
@@ -269,26 +351,108 @@ total_trans_si = count_unique_transactions(df_si_f)
 
 
 # --- PROSES PERHITUNGAN (Menggunakan Data Item) ---
-#total_item_so = df_so_f.groupby('transaction_number')['product_id'].nunique().sum() if not df_so_f.empty else 0
-total_item_so = df_so_f[['transaction_number', 'product_id']].drop_duplicates().shape[0]
-total_item_pr = df_pr_f[['transaction_number', 'product_id']].drop_duplicates().shape[0]
-#total_item_pr = df_pr_f.groupby('transaction_number')['product_id'].nunique().sum() if not df_pr_f.empty else 0
-#total_item_pr = df_pr_f['product_id'].nunique() if not df_pr_f.empty else 0
-total_item_po = df_po_f[['transaction_number', 'product_id']].drop_duplicates().shape[0]
-#total_item_po = df_po_f.groupby('transaction_number')['product_id'].nunique().sum() if not df_po_f.empty else 0
-total_item_grn = df_grn_f[['transaction_number', 'product_id']].drop_duplicates().shape[0]
-#total_item_grn = df_grn_f.groupby('transaction_number')['product_id'].nunique().sum() if not df_grn_f.empty else 0
-total_item_do = df_do_f[['transaction_number', 'product_id']].drop_duplicates().shape[0]
-#total_item_do = df_do_f.groupby('transaction_number')['product_id'].nunique().sum() if not df_do_f.empty else 0
-total_item_si = df_si_f[['transaction_number', 'product_id']].drop_duplicates().shape[0]
-#total_item_si = df_si_f.groupby('transaction_number')['product_id'].nunique().sum() if not df_si_f.empty else 0
+def _find_col_by_alternatives(df, alternatives):
+    if df is None or (hasattr(df, 'empty') and df.empty):
+        return None
+    norm = {c: c.strip().lower().replace(' ', '_') for c in df.columns.astype(str)}
+    for alt in alternatives:
+        alt_norm = alt.strip().lower().replace(' ', '_')
+        for orig, n in norm.items():
+            if n == alt_norm:
+                return orig
+    return None
 
-df_unique_so = df_so_f.drop_duplicates(subset=['transaction_number', 'product_id'])
-df_unique_pr = df_pr_f.drop_duplicates(subset=['transaction_number', 'product_id'])
-df_unique_po = df_po_f.drop_duplicates(subset=['transaction_number', 'product_id'])
-df_unique_grn = df_grn_f.drop_duplicates(subset=['transaction_number', 'product_id'])
-df_unique_do = df_do_f.drop_duplicates(subset=['transaction_number', 'product_id'])
-df_unique_si = df_si_f.drop_duplicates(subset=['transaction_number', 'product_id'])
+def pair_count(df, txn_alts=None, prod_alts=None):
+    if df is None or (hasattr(df, 'empty') and df.empty):
+        return 0
+    txn_alts = txn_alts or ['transaction_number', 'transaction_no', 'transaction', 'trx_number', 'trx']
+    prod_alts = prod_alts or ['product_id', 'product id', 'productid', 'product_code', 'sku', 'item_code']
+
+    txn_col = _find_col_by_alternatives(df, txn_alts)
+    prod_col = _find_col_by_alternatives(df, prod_alts)
+
+    if not txn_col or not prod_col:
+        print(f"Warning: missing columns for pair count. txn_col={txn_col}, prod_col={prod_col}. Available: {df.columns.tolist()}")
+        return 0
+
+    return df[[txn_col, prod_col]].drop_duplicates().shape[0]
+
+total_item_so = pair_count(df_so_f)
+total_item_pr = pair_count(df_pr_f)
+total_item_po = pair_count(df_po_f)
+total_item_grn = pair_count(df_grn_f)
+total_item_do = pair_count(df_do_f)
+total_item_si = pair_count(df_si_f)
+
+# Build df_unique_* using the discovered columns where possible
+def unique_pairs_df(df):
+    if df is None or (hasattr(df, 'empty') and df.empty):
+        return pd.DataFrame()
+    txn_col = _find_col_by_alternatives(df, ['transaction_number', 'transaction_no', 'transaction', 'trx_number', 'trx'])
+    prod_col = _find_col_by_alternatives(df, ['product_id', 'product id', 'productid', 'product_code', 'sku', 'item_code'])
+    if not txn_col or not prod_col:
+        return pd.DataFrame()
+    return df.drop_duplicates(subset=[txn_col, prod_col])
+
+
+# --- Safe helpers to tolerate missing/malformed columns ---
+def safe_sum(df, col):
+    if df is None or (hasattr(df, 'empty') and df.empty):
+        return 0
+    if col in df.columns:
+        return pd.to_numeric(df[col], errors='coerce').fillna(0).sum()
+    return 0
+
+
+def safe_col_series(df, col, default=0):
+    if df is None or (hasattr(df, 'empty') and df.empty):
+        return pd.Series(dtype=float)
+    if col in df.columns:
+        return pd.to_numeric(df[col], errors='coerce').fillna(default)
+    return pd.Series([default] * len(df), index=df.index)
+
+
+def ensure_columns_exist(df, cols, default=0):
+    # Ensure dataframe `df` contains `cols`. If missing, create with `default`.
+    if df is None:
+        return None
+    for c in cols:
+        if c not in df.columns:
+            df[c] = default
+    return df
+
+
+def sanitize_reconcile(df, numeric_cols=None, id_cols=None, default_numeric=0, default_id='-'):
+    """Ensure `df` contains expected numeric and id columns, fill missing, coerce numeric, and convert ints safely."""
+    if df is None:
+        return pd.DataFrame()
+    numeric_cols = numeric_cols or []
+    id_cols = id_cols or []
+    for c in numeric_cols:
+        if c not in df.columns:
+            df[c] = default_numeric
+        else:
+            df[c] = pd.to_numeric(df[c], errors='coerce').fillna(default_numeric)
+    for c in id_cols:
+        if c not in df.columns:
+            df[c] = default_id
+        else:
+            df[c] = df[c].fillna(default_id)
+    # convert integer-looking numeric cols to int where safe
+    for c in numeric_cols:
+        try:
+            df[c] = df[c].astype(int)
+        except Exception:
+            df[c] = pd.to_numeric(df[c], errors='coerce').fillna(default_numeric).astype(int)
+    return df
+
+
+df_unique_so = unique_pairs_df(df_so_f)
+df_unique_pr = unique_pairs_df(df_pr_f)
+df_unique_po = unique_pairs_df(df_po_f)
+df_unique_grn = unique_pairs_df(df_grn_f)
+df_unique_do = unique_pairs_df(df_do_f)
+df_unique_si = unique_pairs_df(df_si_f)
 
 prog_so_pr = (total_item_pr / total_item_so * 100) if total_item_so > 0 else 0
 prog_pr_po = (total_item_po / total_item_pr * 100) if total_item_pr > 0 else 0
@@ -296,8 +460,10 @@ prog_po_grn = (total_item_grn / total_item_po * 100) if total_item_po > 0 else 0
 prog_grn_do = (total_item_do / total_item_grn * 100) if total_item_grn > 0 else 0
 prog_do_si = (total_item_si / total_item_do * 100) if total_item_do > 0 else 0
 
-net_revenue = df_si_real['total_item'].sum() if not df_si_real.empty else 0
-gross_revenue = df_si_real['transaction_total_item'].sum() if not df_si_real.empty else 0
+# Safe revenue calculations
+net_revenue = safe_sum(df_si_real, 'total_item')
+gross_revenue = safe_sum(df_si_real, 'transaction_total_item')
+
 
 # --- RECONCILE LOGIC (Menggunakan Data _f) ---
 
@@ -313,49 +479,97 @@ for col in cols_to_fix:
 
 # --- SO vs PR #SO BALANCE (VERSI FIX) ---
 
-# 1. Pastikan kolom di df_so_f sudah numerik sebelum diproses
-df_so_f['tax1_percentage'] = pd.to_numeric(df_so_f['tax1_percentage'], errors='coerce').fillna(0)
-df_so_f['tax2_percentage'] = pd.to_numeric(df_so_f['tax2_percentage'], errors='coerce').fillna(0)
-df_so_f['discount'] = pd.to_numeric(df_so_f['discount'], errors='coerce').fillna(0)
-df_so_f['price'] = pd.to_numeric(df_so_f['price'], errors='coerce').fillna(0)
-df_so_f['quantity'] = pd.to_numeric(df_so_f['quantity'], errors='coerce').fillna(0)
-df_so_f['transaction_number'] = df_so_f['transaction_number'].astype(str).str.strip().str.upper()
-df_so_f['product_id'] = df_so_f['product_id'].astype(str).str.strip().str.upper()
+# 1. Pastikan kolom di df_so_f sudah numerik sebelum diproses (aman jika kolom tidak ada)
+for col in ('tax1_percentage', 'tax2_percentage', 'discount', 'price', 'quantity'):
+    if col in df_so_f.columns:
+        df_so_f[col] = pd.to_numeric(df_so_f[col], errors='coerce').fillna(0)
 
-# 2. Bersihkan data PR
-# Pastikan kolom referensi di PR juga dibersihkan
-df_pr_f['so_transaction_number'] = df_pr_f['so_transaction_number'].astype(str).str.strip().str.upper()
-df_pr_f['product_id'] = df_pr_f['product_id'].astype(str).str.strip().str.upper()
-df_pr_f['quantity'] = pd.to_numeric(df_pr_f['quantity'], errors='coerce').fillna(0)
+# Normalisasi dan rename alternatif untuk `transaction_number` dan `product_id`
+if 'transaction_number' not in df_so_f.columns:
+    alt = _find_col_by_alternatives(df_so_f, ['transaction_no', 'transaction no', 'transactionnumber', 'trx_number', 'trx', 'transaction'])
+    if alt:
+        df_so_f = df_so_f.rename(columns={alt: 'transaction_number'})
 
-# 2. Bersihkan data DO
-# Pastikan kolom referensi di PR juga dibersihkan
-df_do_f['so_transaction_number'] = df_do_f['so_transaction_number'].astype(str).str.strip().str.upper()
-df_do_f['product_id'] = df_do_f['product_id'].astype(str).str.strip().str.upper()
-df_do_f['quantity'] = pd.to_numeric(df_do_f['quantity'], errors='coerce').fillna(0)
+if 'product_id' not in df_so_f.columns:
+    alt = _find_col_by_alternatives(df_so_f, ['product_id', 'product id', 'productid', 'product_code', 'productcode', 'sku', 'item_code', 'item code', 'product'])
+    if alt:
+        df_so_f = df_so_f.rename(columns={alt: 'product_id'})
+
+if 'transaction_number' in df_so_f.columns:
+    df_so_f['transaction_number'] = df_so_f['transaction_number'].astype(str).str.strip().str.upper()
+if 'product_id' in df_so_f.columns:
+    df_so_f['product_id'] = df_so_f['product_id'].astype(str).str.strip().str.upper()
+
+# 2. Bersihkan data PR (aman: cek keberadaan kolom)
+if 'so_transaction_number' not in df_pr_f.columns:
+    alt = _find_col_by_alternatives(df_pr_f, ['so_transaction_number', 'so_transaction_no', 'so_transaction', 'transaction_number'])
+    if alt:
+        df_pr_f = df_pr_f.rename(columns={alt: 'so_transaction_number'})
+if 'so_transaction_number' in df_pr_f.columns:
+    df_pr_f['so_transaction_number'] = df_pr_f['so_transaction_number'].astype(str).str.strip().str.upper()
+if 'product_id' in df_pr_f.columns:
+    df_pr_f['product_id'] = df_pr_f['product_id'].astype(str).str.strip().str.upper()
+if 'quantity' in df_pr_f.columns:
+    df_pr_f['quantity'] = pd.to_numeric(df_pr_f['quantity'], errors='coerce').fillna(0)
+
+# 2. Bersihkan data DO (aman: cek keberadaan kolom)
+if 'so_transaction_number' not in df_do_f.columns:
+    alt = _find_col_by_alternatives(df_do_f, ['so_transaction_number', 'so_transaction_no', 'so_transaction', 'transaction_number'])
+    if alt:
+        df_do_f = df_do_f.rename(columns={alt: 'so_transaction_number'})
+if 'so_transaction_number' in df_do_f.columns:
+    df_do_f['so_transaction_number'] = df_do_f['so_transaction_number'].astype(str).str.strip().str.upper()
+if 'product_id' in df_do_f.columns:
+    df_do_f['product_id'] = df_do_f['product_id'].astype(str).str.strip().str.upper()
+if 'quantity' in df_do_f.columns:
+    df_do_f['quantity'] = pd.to_numeric(df_do_f['quantity'], errors='coerce').fillna(0)
 
 # 2. Grouping SO: Ambil detail unik per item per transaksi
-df_so_grouped = df_so_f.groupby(['transaction_number', 'product_id'], as_index=False).agg({
-    'item_name': 'first',      # Mengambil nama item
-    'customer_name': 'first',  # Mengambil nama customer
-    'price': 'first',
-    'quantity': 'sum',
-    'discount': 'sum',
-    'tax1_percentage': 'first',
-    'tax2_percentage': 'first',
-})
+# Ensure we have standard `transaction_number` and `product_id` columns (try alternatives)
+txn_alt = ['transaction_number', 'transaction_no', 'transaction no', 'transactionnumber', 'trx_number', 'trx', 'transaction']
+prod_alt = ['product_id', 'product id', 'productid', 'product_code', 'productcode', 'sku', 'item_code', 'item code', 'product']
+
+txn_col = _find_col_by_alternatives(df_so_f, txn_alt) or next((c for c in df_so_f.columns if 'transaction' in c.lower()), None)
+prod_col = _find_col_by_alternatives(df_so_f, prod_alt) or next((c for c in df_so_f.columns if any(k in c.lower() for k in ('product', 'item', 'sku', 'code'))), None)
+
+if txn_col and txn_col != 'transaction_number':
+    df_so_f = df_so_f.rename(columns={txn_col: 'transaction_number'})
+if prod_col and prod_col != 'product_id':
+    df_so_f = df_so_f.rename(columns={prod_col: 'product_id'})
+
+if 'transaction_number' in df_so_f.columns and 'product_id' in df_so_f.columns:
+    df_so_grouped = df_so_f.groupby(['transaction_number', 'product_id'], as_index=False).agg({
+        'item_name': 'first',      # Mengambil nama item
+        'customer_name': 'first',  # Mengambil nama customer
+        'price': 'first',
+        'quantity': 'sum',
+        'discount': 'sum',
+        'tax1_percentage': 'first',
+        'tax2_percentage': 'first',
+    })
+else:
+    print('Warning: cannot group SO because required columns are missing. Available:', df_so_f.columns.tolist())
+    df_so_grouped = pd.DataFrame(columns=['transaction_number','product_id','item_name','customer_name','price','quantity','discount','tax1_percentage','tax2_percentage'])
 
 # 3. Grouping PR: Agregasi sisa quantity (PENTING: Harus unik per SO + Product)
-df_pr_grouped_clean = df_pr_f.groupby(['so_transaction_number', 'product_id'], as_index=False).agg({
-    'transaction_number' : 'first',
-    'quantity': 'sum'
-})
+if 'so_transaction_number' in df_pr_f.columns and 'product_id' in df_pr_f.columns:
+    df_pr_grouped_clean = df_pr_f.groupby(['so_transaction_number', 'product_id'], as_index=False).agg({
+        'transaction_number' : 'first',
+        'quantity': 'sum'
+    })
+else:
+    print('Warning: cannot group PR because required columns are missing. Available:', df_pr_f.columns.tolist())
+    df_pr_grouped_clean = pd.DataFrame(columns=['so_transaction_number','product_id','transaction_number','quantity'])
 
 # 3. Grouping PR: Agregasi sisa quantity (PENTING: Harus unik per SO + Product)
-df_do_grouped_clean = df_do_f.groupby(['so_transaction_number', 'product_id'], as_index=False).agg({
-    'transaction_number' : 'first',
-    'quantity': 'sum'
-})
+if 'so_transaction_number' in df_do_f.columns and 'product_id' in df_do_f.columns:
+    df_do_grouped_clean = df_do_f.groupby(['so_transaction_number', 'product_id'], as_index=False).agg({
+        'transaction_number' : 'first',
+        'quantity': 'sum'
+    })
+else:
+    print('Warning: cannot group DO because required columns are missing. Available:', df_do_f.columns.tolist())
+    df_do_grouped_clean = pd.DataFrame(columns=['so_transaction_number','product_id','transaction_number','quantity'])
 
 # 4. Merge
 #Hitung Sisa Qty (Net Qty)
@@ -394,20 +608,16 @@ reconcile = reconcile.merge(
     'transaction_number': 'transaction_number_do'
 })
 
-# 3. Handle Nilai Kosong & Hitung Net Qty
-reconcile[['quantity_pr', 'quantity_do']] = reconcile[['quantity_pr', 'quantity_do']].fillna(0)
-# Isi nomor transaksi yang kosong (karena tidak ada match) dengan string '-'
-reconcile[['transaction_number_pr', 'transaction_number_do']] = reconcile[['transaction_number_pr', 'transaction_number_do']].fillna('-')
+# 3. Handle Nilai Kosong & Hitung Net Qty (safely)
+reconcile = sanitize_reconcile(
+    reconcile,
+    numeric_cols=['quantity_so', 'quantity_pr', 'quantity_do', 'price', 'discount', 'tax1_percentage', 'tax2_percentage'],
+    id_cols=['transaction_number_pr', 'transaction_number_do', 'transaction_number_so', 'customer_name', 'product_id', 'item_name']
+)
 
 reconcile['total_fulfilled'] = reconcile['quantity_pr'] + reconcile['quantity_do']
 reconcile['net_qty'] = (reconcile['quantity_so'] - reconcile['total_fulfilled']).clip(lower=0)
-
-# >> PERBAIKAN DI SINI: Ubah tipe data ke Integer <<
-# Kita ubah semua kolom quantity menjadi integer untuk menghilangkan .0
-cols_to_int = ['quantity_so', 'quantity_pr', 'quantity_do', 'net_qty']
-for col in cols_to_int:
-    if col in reconcile.columns:
-        reconcile[col] = reconcile[col].astype(int)
+reconcile['net_qty'] = reconcile['net_qty'].astype(int)
 
 
 # Rumus Rupiah (Pastikan kolom price/discount ada di df_so_grouped)
@@ -464,43 +674,75 @@ for col in cols_to_fix:
 
 # --- PR vs PO #PR BALANCE (VERSI FIX) ---
 
-# 1. Pastikan kolom di df_pr_f sudah numerik sebelum diproses
-df_pr_f['tax1_percentage'] = pd.to_numeric(df_pr_f['tax1_percentage'], errors='coerce').fillna(0)
-df_pr_f['tax2_percentage'] = pd.to_numeric(df_pr_f['tax2_percentage'], errors='coerce').fillna(0)
-df_pr_f['discount'] = pd.to_numeric(df_pr_f['discount'], errors='coerce').fillna(0)
-df_pr_f['price'] = pd.to_numeric(df_pr_f['price'], errors='coerce').fillna(0)
-df_pr_f['quantity'] = pd.to_numeric(df_pr_f['quantity'], errors='coerce').fillna(0)
-df_pr_f['transaction_number'] = df_pr_f['transaction_number'].astype(str).str.strip().str.upper()
-df_pr_f['product_id'] = df_pr_f['product_id'].astype(str).str.strip().str.upper()
+# 1. Pastikan kolom di df_pr_f sudah numerik sebelum diproses (aman jika kolom tidak ada)
+for col in ('tax1_percentage', 'tax2_percentage', 'discount', 'price', 'quantity'):
+    if col in df_pr_f.columns:
+        df_pr_f[col] = pd.to_numeric(df_pr_f[col], errors='coerce').fillna(0)
 
-# 2. Bersihkan data PO
-# Pastikan kolom referensi di PR juga dibersihkan
-df_po_f['so_transaction_number'] = df_po_f['so_transaction_number'].astype(str).str.strip().str.upper()
-df_po_f['product_id'] = df_po_f['product_id'].astype(str).str.strip().str.upper()
-df_po_f['quantity'] = pd.to_numeric(df_po_f['quantity'], errors='coerce').fillna(0)
+# Normalisasi nama kolom pada PR
+txn_alt = ['transaction_number', 'transaction_no', 'transaction', 'trx_number', 'trx']
+prod_alt = ['product_id', 'product id', 'productid', 'product_code', 'sku', 'item_code']
 
-# 2. Grouping SO: Ambil detail unik per item per transaksi
-df_pr_grouped = df_pr_f.groupby(['transaction_number', 'product_id'], as_index=False).agg({
-    'item_name': 'first',      # Mengambil nama item
-    'customer_name': 'first',  # Mengambil nama customer
-    'price': 'first',
-    'quantity': 'sum',
-    'discount': 'sum',
-    'tax1_percentage': 'first',
-    'tax2_percentage': 'first'
-})
+txn_col = _find_col_by_alternatives(df_pr_f, txn_alt) or next((c for c in df_pr_f.columns if 'transaction' in c.lower()), None)
+prod_col = _find_col_by_alternatives(df_pr_f, prod_alt) or next((c for c in df_pr_f.columns if any(k in c.lower() for k in ('product','item','sku','code'))), None)
+
+if txn_col and txn_col != 'transaction_number':
+    df_pr_f = df_pr_f.rename(columns={txn_col: 'transaction_number'})
+if prod_col and prod_col != 'product_id':
+    df_pr_f = df_pr_f.rename(columns={prod_col: 'product_id'})
+
+if 'transaction_number' in df_pr_f.columns:
+    df_pr_f['transaction_number'] = df_pr_f['transaction_number'].astype(str).str.strip().str.upper()
+if 'product_id' in df_pr_f.columns:
+    df_pr_f['product_id'] = df_pr_f['product_id'].astype(str).str.strip().str.upper()
+
+# 2. Bersihkan data PO (cek kolom dengan aman)
+if 'so_transaction_number' not in df_po_f.columns:
+    alt = _find_col_by_alternatives(df_po_f, ['so_transaction_number', 'so_transaction_no', 'so_transaction', 'transaction_number'])
+    if alt:
+        df_po_f = df_po_f.rename(columns={alt: 'so_transaction_number'})
+if 'so_transaction_number' in df_po_f.columns:
+    df_po_f['so_transaction_number'] = df_po_f['so_transaction_number'].astype(str).str.strip().str.upper()
+if 'product_id' in df_po_f.columns:
+    df_po_f['product_id'] = df_po_f['product_id'].astype(str).str.strip().str.upper()
+if 'quantity' in df_po_f.columns:
+    df_po_f['quantity'] = pd.to_numeric(df_po_f['quantity'], errors='coerce').fillna(0)
+
+# 2. Grouping SO/PR if possible, otherwise create empty frames with expected columns
+if 'transaction_number' in df_pr_f.columns and 'product_id' in df_pr_f.columns:
+    df_pr_grouped = df_pr_f.groupby(['transaction_number', 'product_id'], as_index=False).agg({
+        'item_name': 'first',      # Mengambil nama item
+        'customer_name': 'first',  # Mengambil nama customer
+        'price': 'first',
+        'quantity': 'sum',
+        'discount': 'sum',
+        'tax1_percentage': 'first',
+        'tax2_percentage': 'first'
+    })
+else:
+    print('Warning: cannot group PR because required columns are missing. Available:', df_pr_f.columns.tolist())
+    df_pr_grouped = pd.DataFrame(columns=['transaction_number','product_id','item_name','customer_name','price','quantity','discount','tax1_percentage','tax2_percentage'])
 
 # 3. Grouping PR: Agregasi sisa quantity (PENTING: Harus unik per PR + Product)
-df_po_grouped_clean = df_po_f.groupby(['pr_transaction_number', 'product_id'], as_index=False).agg({
-    'transaction_number' : 'first',
-    'quantity': 'sum'
-})
+if 'pr_transaction_number' in df_po_f.columns and 'product_id' in df_po_f.columns:
+    df_po_grouped_clean = df_po_f.groupby(['pr_transaction_number', 'product_id'], as_index=False).agg({
+        'transaction_number' : 'first',
+        'quantity': 'sum'
+    })
+else:
+    print('Warning: cannot group PO because required columns are missing. Available:', df_po_f.columns.tolist())
+    df_po_grouped_clean = pd.DataFrame(columns=['pr_transaction_number','product_id','transaction_number','quantity'])
 
 # 4. Merge
 #Hitung Sisa Qty (Net Qty)
 reconcile_pr_po = df_pr_grouped.merge(df_po_grouped_clean, left_on=['transaction_number', 'product_id'], 
                                      right_on=['pr_transaction_number', 'product_id'], how='left', suffixes=('_pr','_po'))
-reconcile_pr_po['quantity_po'] = reconcile_pr_po['quantity_po'].fillna(0)
+# Sanitize merged frame so subsequent calculations won't KeyError
+reconcile_pr_po = sanitize_reconcile(
+    reconcile_pr_po,
+    numeric_cols=['quantity_pr', 'quantity_po', 'net_qty', 'price', 'discount', 'tax1_percentage', 'tax2_percentage'],
+    id_cols=['transaction_number_pr', 'transaction_number_po', 'customer_name', 'product_id', 'item_name']
+)
 reconcile_pr_po['net_qty'] = (reconcile_pr_po['quantity_pr'] - reconcile_pr_po['quantity_po']).clip(lower=0)
 
 # 4. HITUNG SALDO BERDASARKAN UNIT PRICE
@@ -525,10 +767,7 @@ total_baris_pending = len(reconcile_pr_po[reconcile_pr_po['net_qty'] > 0])
 
 # 1. Ubah format item_name
 reconcile_pr_po['item_name'] = reconcile_pr_po['item_name'].str.replace(';', ' ', regex=False)
-# 2. Ubah tipe data ke integer untuk menghilangkan .0
-reconcile_pr_po['quantity_pr'] = reconcile_pr_po['quantity_pr'].astype(int)
-reconcile_pr_po['quantity_po'] = reconcile_pr_po['quantity_po'].astype(int)
-reconcile_pr_po['net_qty'] = reconcile_pr_po['net_qty'].astype(int)
+# quantity/net columns already coerced to int by sanitize_reconcile
 
 df_download_pr = reconcile_pr_po[[
     'transaction_number_pr', 
@@ -558,45 +797,77 @@ for col in cols_to_fix:
     if col in df_po_f.columns:
         df_po_f[col] = pd.to_numeric(df_po_f[col], errors='coerce').fillna(0)
 
-# --- SO vs PR #SO BALANCE (VERSI FIX) ---
+# --- PO vs GRN (VERSI FIX) ---
 
-# 1. Pastikan kolom di df_po_f sudah numerik sebelum diproses
-df_po_f['tax1_percentage'] = pd.to_numeric(df_po_f['tax1_percentage'], errors='coerce').fillna(0)
-df_po_f['tax2_percentage'] = pd.to_numeric(df_po_f['tax2_percentage'], errors='coerce').fillna(0)
-df_po_f['discount'] = pd.to_numeric(df_po_f['discount'], errors='coerce').fillna(0)
-df_po_f['price'] = pd.to_numeric(df_po_f['price'], errors='coerce').fillna(0)
-df_po_f['quantity'] = pd.to_numeric(df_po_f['quantity'], errors='coerce').fillna(0)
-df_po_f['transaction_number'] = df_po_f['transaction_number'].astype(str).str.strip().str.upper()
-df_po_f['product_id'] = df_po_f['product_id'].astype(str).str.strip().str.upper()
+# 1. Pastikan kolom numerik tersedia di PO (aman jika kolom tidak ada)
+for col in ('tax1_percentage', 'tax2_percentage', 'discount', 'price', 'quantity'):
+    if col in df_po_f.columns:
+        df_po_f[col] = pd.to_numeric(df_po_f[col], errors='coerce').fillna(0)
+
+# Normalisasi nama kolom pada PO
+txn_alt = ['transaction_number', 'transaction_no', 'transaction', 'trx_number', 'trx']
+prod_alt = ['product_id', 'product id', 'productid', 'product_code', 'sku', 'item_code']
+
+txn_col = _find_col_by_alternatives(df_po_f, txn_alt) or next((c for c in df_po_f.columns if 'transaction' in c.lower()), None)
+prod_col = _find_col_by_alternatives(df_po_f, prod_alt) or next((c for c in df_po_f.columns if any(k in c.lower() for k in ('product','item','sku','code'))), None)
+
+if txn_col and txn_col != 'transaction_number':
+    df_po_f = df_po_f.rename(columns={txn_col: 'transaction_number'})
+if prod_col and prod_col != 'product_id':
+    df_po_f = df_po_f.rename(columns={prod_col: 'product_id'})
+
+if 'transaction_number' in df_po_f.columns:
+    df_po_f['transaction_number'] = df_po_f['transaction_number'].astype(str).str.strip().str.upper()
+if 'product_id' in df_po_f.columns:
+    df_po_f['product_id'] = df_po_f['product_id'].astype(str).str.strip().str.upper()
 
 # 2. Bersihkan data GRN
-# Pastikan kolom referensi di PR juga dibersihkan
-df_grn_f['po_transaction_number'] = df_grn_f['po_transaction_number'].astype(str).str.strip().str.upper()
-df_grn_f['product_id'] = df_grn_f['product_id'].astype(str).str.strip().str.upper()
-df_grn_f['quantity'] = pd.to_numeric(df_grn_f['quantity'], errors='coerce').fillna(0)
+if 'po_transaction_number' not in df_grn_f.columns:
+    alt = _find_col_by_alternatives(df_grn_f, ['po_transaction_number', 'po_transaction_no', 'po_transaction', 'transaction_number'])
+    if alt:
+        df_grn_f = df_grn_f.rename(columns={alt: 'po_transaction_number'})
+if 'po_transaction_number' in df_grn_f.columns:
+    df_grn_f['po_transaction_number'] = df_grn_f['po_transaction_number'].astype(str).str.strip().str.upper()
+if 'product_id' in df_grn_f.columns:
+    df_grn_f['product_id'] = df_grn_f['product_id'].astype(str).str.strip().str.upper()
+if 'quantity' in df_grn_f.columns:
+    df_grn_f['quantity'] = pd.to_numeric(df_grn_f['quantity'], errors='coerce').fillna(0)
 
-# 2. Grouping SO: Ambil detail unik per item per transaksi
-df_po_grouped = df_po_f.groupby(['transaction_number', 'product_id'], as_index=False).agg({
-    'item_name': 'first',      # Mengambil nama item
-    'customer_name': 'first',  # Mengambil nama customer
-    'price': 'first',
-    'quantity': 'sum',
-    'discount': 'sum',
-    'tax1_percentage': 'first',
-    'tax2_percentage': 'first',
-})
+# Grouping PO if possible, otherwise empty frame with expected columns
+if 'transaction_number' in df_po_f.columns and 'product_id' in df_po_f.columns:
+    df_po_grouped = df_po_f.groupby(['transaction_number', 'product_id'], as_index=False).agg({
+        'item_name': 'first',      # Mengambil nama item
+        'customer_name': 'first',  # Mengambil nama customer
+        'price': 'first',
+        'quantity': 'sum',
+        'discount': 'sum',
+        'tax1_percentage': 'first',
+        'tax2_percentage': 'first',
+    })
+else:
+    print('Warning: cannot group PO because required columns are missing. Available:', df_po_f.columns.tolist())
+    df_po_grouped = pd.DataFrame(columns=['transaction_number','product_id','item_name','customer_name','price','quantity','discount','tax1_percentage','tax2_percentage'])
 
-# 3. Grouping PR: Agregasi sisa quantity (PENTING: Harus unik per SO + Product)
-df_grn_grouped_clean = df_grn_f.groupby(['po_transaction_number', 'product_id'], as_index=False).agg({
-    'transaction_number' : 'first',
-    'quantity': 'sum'
-})
+# Grouping GRN for aggregated quantity
+if 'po_transaction_number' in df_grn_f.columns and 'product_id' in df_grn_f.columns:
+    df_grn_grouped_clean = df_grn_f.groupby(['po_transaction_number', 'product_id'], as_index=False).agg({
+        'transaction_number' : 'first',
+        'quantity': 'sum'
+    })
+else:
+    print('Warning: cannot group GRN because required columns are missing. Available:', df_grn_f.columns.tolist())
+    df_grn_grouped_clean = pd.DataFrame(columns=['po_transaction_number','product_id','transaction_number','quantity'])
 
 # 4. Merge
 #Hitung Sisa Qty (Net Qty)
 reconcile_po_grn = df_po_grouped.merge(df_grn_grouped_clean, left_on=['transaction_number', 'product_id'], 
                                      right_on=['po_transaction_number', 'product_id'], how='left', suffixes=('_po','_grn'))
-reconcile_po_grn['quantity_grn'] = reconcile_po_grn['quantity_grn'].fillna(0)
+# Sanitize merged frame for safe calculations
+reconcile_po_grn = sanitize_reconcile(
+    reconcile_po_grn,
+    numeric_cols=['quantity_po', 'quantity_grn', 'net_qty', 'price', 'discount', 'tax1_percentage', 'tax2_percentage'],
+    id_cols=['transaction_number_po', 'transaction_number_grn', 'customer_name', 'product_id', 'item_name']
+)
 reconcile_po_grn['net_qty'] = (reconcile_po_grn['quantity_po'] - reconcile_po_grn['quantity_grn']).clip(lower=0)
 
 # 4. HITUNG SALDO BERDASARKAN UNIT PRICE
@@ -621,10 +892,7 @@ total_baris_pending = len(reconcile_po_grn[reconcile_po_grn['net_qty'] > 0])
 
 # 1. Ubah format item_name
 reconcile_po_grn['item_name'] = reconcile_po_grn['item_name'].str.replace(';', ' ', regex=False)
-# 2. Ubah tipe data ke integer untuk menghilangkan .0
-reconcile_po_grn['quantity_po'] = reconcile_po_grn['quantity_po'].astype(int)
-reconcile_po_grn['quantity_grn'] = reconcile_po_grn['quantity_grn'].astype(int)
-reconcile_po_grn['net_qty'] = reconcile_po_grn['net_qty'].astype(int)
+# quantity/net columns already coerced to int by sanitize_reconcile
 
 df_download_po = reconcile_po_grn[[
     'transaction_number_po', 
@@ -654,44 +922,76 @@ for col in cols_to_fix:
     if col in df_grn_f.columns:
         df_grn_f[col] = pd.to_numeric(df_grn_f[col], errors='coerce').fillna(0)
 
-# --- SO vs PR #SO BALANCE (VERSI FIX) ---
+# --- GRN vs DO (VERSI FIX) ---
 
-# 1. Pastikan kolom di df_grn_f sudah numerik sebelum diproses
-df_grn_f['tax1_percentage'] = pd.to_numeric(df_grn_f['tax1_percentage'], errors='coerce').fillna(0)
-df_grn_f['tax2_percentage'] = pd.to_numeric(df_grn_f['tax2_percentage'], errors='coerce').fillna(0)
-df_grn_f['discount'] = pd.to_numeric(df_grn_f['discount'], errors='coerce').fillna(0)
-df_grn_f['price'] = pd.to_numeric(df_grn_f['price'], errors='coerce').fillna(0)
-df_grn_f['quantity'] = pd.to_numeric(df_grn_f['quantity'], errors='coerce').fillna(0)
-df_grn_f['transaction_number'] = df_grn_f['transaction_number'].astype(str).str.strip().str.upper()
-df_grn_f['product_id'] = df_grn_f['product_id'].astype(str).str.strip().str.upper()
+# 1. Pastikan kolom numerik tersedia di GRN (aman jika kolom tidak ada)
+for col in ('tax1_percentage', 'tax2_percentage', 'discount', 'price', 'quantity'):
+    if col in df_grn_f.columns:
+        df_grn_f[col] = pd.to_numeric(df_grn_f[col], errors='coerce').fillna(0)
 
-# 2. Bersihkan data GRN
-# Pastikan kolom referensi di PR juga dibersihkan
-df_do_f['so_transaction_number'] = df_do_f['so_transaction_number'].astype(str).str.strip().str.upper()
-df_do_f['product_id'] = df_do_f['product_id'].astype(str).str.strip().str.upper()
-df_do_f['quantity'] = pd.to_numeric(df_do_f['quantity'], errors='coerce').fillna(0)
+# Normalisasi nama kolom pada GRN
+txn_alt = ['transaction_number', 'transaction_no', 'transaction', 'trx_number', 'trx']
+prod_alt = ['product_id', 'product id', 'productid', 'product_code', 'sku', 'item_code']
 
-# 2. Grouping SO: Ambil detail unik per item per transaksi
-df_grn_grouped = df_grn_f.groupby(['transaction_number', 'product_id'], as_index=False).agg({
-    'item_name': 'first',      # Mengambil nama item
-    'price': 'first',
-    'quantity': 'sum',
-    'discount': 'sum',
-    'tax1_percentage': 'first',
-    'tax2_percentage': 'first',
-})
+txn_col = _find_col_by_alternatives(df_grn_f, txn_alt) or next((c for c in df_grn_f.columns if 'transaction' in c.lower()), None)
+prod_col = _find_col_by_alternatives(df_grn_f, prod_alt) or next((c for c in df_grn_f.columns if any(k in c.lower() for k in ('product','item','sku','code'))), None)
 
-# 3. Grouping PR: Agregasi sisa quantity (PENTING: Harus unik per SO + Product)
-df_do_grouped_clean = df_do_f.groupby(['grn_transaction_number', 'product_id'], as_index=False).agg({
-    'transaction_number' : 'first',
-    'quantity': 'sum'
-})
+if txn_col and txn_col != 'transaction_number':
+    df_grn_f = df_grn_f.rename(columns={txn_col: 'transaction_number'})
+if prod_col and prod_col != 'product_id':
+    df_grn_f = df_grn_f.rename(columns={prod_col: 'product_id'})
+
+if 'transaction_number' in df_grn_f.columns:
+    df_grn_f['transaction_number'] = df_grn_f['transaction_number'].astype(str).str.strip().str.upper()
+if 'product_id' in df_grn_f.columns:
+    df_grn_f['product_id'] = df_grn_f['product_id'].astype(str).str.strip().str.upper()
+
+# 2. Bersihkan data DO
+if 'so_transaction_number' not in df_do_f.columns:
+    alt = _find_col_by_alternatives(df_do_f, ['so_transaction_number', 'so_transaction_no', 'so_transaction', 'transaction_number'])
+    if alt:
+        df_do_f = df_do_f.rename(columns={alt: 'so_transaction_number'})
+if 'so_transaction_number' in df_do_f.columns:
+    df_do_f['so_transaction_number'] = df_do_f['so_transaction_number'].astype(str).str.strip().str.upper()
+if 'product_id' in df_do_f.columns:
+    df_do_f['product_id'] = df_do_f['product_id'].astype(str).str.strip().str.upper()
+if 'quantity' in df_do_f.columns:
+    df_do_f['quantity'] = pd.to_numeric(df_do_f['quantity'], errors='coerce').fillna(0)
+
+# Grouping GRN if possible, otherwise provide empty frame with expected columns
+if 'transaction_number' in df_grn_f.columns and 'product_id' in df_grn_f.columns:
+    df_grn_grouped = df_grn_f.groupby(['transaction_number', 'product_id'], as_index=False).agg({
+        'item_name': 'first',      # Mengambil nama item
+        'price': 'first',
+        'quantity': 'sum',
+        'discount': 'sum',
+        'tax1_percentage': 'first',
+        'tax2_percentage': 'first',
+    })
+else:
+    print('Warning: cannot group GRN because required columns are missing. Available:', df_grn_f.columns.tolist())
+    df_grn_grouped = pd.DataFrame(columns=['transaction_number','product_id','item_name','price','quantity','discount','tax1_percentage','tax2_percentage'])
+
+# Grouping DO for aggregated quantity
+if 'grn_transaction_number' in df_do_f.columns and 'product_id' in df_do_f.columns:
+    df_do_grouped_clean = df_do_f.groupby(['grn_transaction_number', 'product_id'], as_index=False).agg({
+        'transaction_number' : 'first',
+        'quantity': 'sum'
+    })
+else:
+    print('Warning: cannot group DO because required columns are missing. Available:', df_do_f.columns.tolist())
+    df_do_grouped_clean = pd.DataFrame(columns=['grn_transaction_number','product_id','transaction_number','quantity'])
 
 # 4. Merge
 #Hitung Sisa Qty (Net Qty)
 reconcile_grn_do = df_grn_grouped.merge(df_do_grouped_clean, left_on=['transaction_number', 'product_id'], 
                                      right_on=['grn_transaction_number', 'product_id'], how='left', suffixes=('_grn','_do'))
-reconcile_grn_do['quantity_do'] = reconcile_grn_do['quantity_do'].fillna(0)
+# Sanitize merged frame for safe calculations
+reconcile_grn_do = sanitize_reconcile(
+    reconcile_grn_do,
+    numeric_cols=['quantity_grn', 'quantity_do', 'net_qty', 'price', 'discount', 'tax1_percentage', 'tax2_percentage'],
+    id_cols=['transaction_number_grn', 'transaction_number_do', 'product_id', 'item_name']
+)
 reconcile_grn_do['net_qty'] = (reconcile_grn_do['quantity_grn'] - reconcile_grn_do['quantity_do']).clip(lower=0)
 
 # 4. HITUNG SALDO BERDASARKAN UNIT PRICE
@@ -715,10 +1015,7 @@ total_baris_pending = len(reconcile_grn_do[reconcile_grn_do['net_qty'] > 0])
 
 # 1. Ubah format item_name
 reconcile_grn_do['item_name'] = reconcile_grn_do['item_name'].str.replace(';', ' ', regex=False)
-# 2. Ubah tipe data ke integer untuk menghilangkan .0
-reconcile_grn_do['quantity_grn'] = reconcile_grn_do['quantity_grn'].astype(int)
-reconcile_grn_do['quantity_do'] = reconcile_grn_do['quantity_do'].astype(int)
-reconcile_grn_do['net_qty'] = reconcile_grn_do['net_qty'].astype(int)
+# quantity/net columns already coerced to int by sanitize_reconcile
 
 df_download_grn = reconcile_grn_do[[
     'transaction_number_grn', 
@@ -740,50 +1037,76 @@ df_download_grn.columns = [
     'Qty Order', 'Qty Terproses', 'Qty Outstanding'
 ]
 
-#DO vs SI
-# Menjumlahkan quantity di data DO
+# DO vs SI
+# Menjumlahkan quantity di data DO (safe conversions)
 cols_to_fix = ['price', 'quantity', 'discount', 'tax1_percentage', 'tax2_percentage']
 for col in cols_to_fix:
     if col in df_do_f.columns:
         df_do_f[col] = pd.to_numeric(df_do_f[col], errors='coerce').fillna(0)
 
-# --- SO vs PR #SO BALANCE (VERSI FIX) ---
+# Normalisasi nama kolom pada DO
+txn_alt = ['transaction_number', 'transaction_no', 'transaction', 'trx_number', 'trx']
+prod_alt = ['product_id', 'product id', 'productid', 'product_code', 'sku', 'item_code']
 
-# 1. Pastikan kolom di df_do_f sudah numerik sebelum diproses
-df_do_f['tax1_percentage'] = pd.to_numeric(df_do_f['tax1_percentage'], errors='coerce').fillna(0)
-df_do_f['tax2_percentage'] = pd.to_numeric(df_do_f['tax2_percentage'], errors='coerce').fillna(0)
-df_do_f['discount'] = pd.to_numeric(df_do_f['discount'], errors='coerce').fillna(0)
-df_do_f['price'] = pd.to_numeric(df_do_f['price'], errors='coerce').fillna(0)
-df_do_f['quantity'] = pd.to_numeric(df_do_f['quantity'], errors='coerce').fillna(0)
-df_do_f['transaction_number'] = df_do_f['transaction_number'].astype(str).str.strip().str.upper()
-df_do_f['product_id'] = df_do_f['product_id'].astype(str).str.strip().str.upper()
+txn_col = _find_col_by_alternatives(df_do_f, txn_alt) or next((c for c in df_do_f.columns if 'transaction' in c.lower()), None)
+prod_col = _find_col_by_alternatives(df_do_f, prod_alt) or next((c for c in df_do_f.columns if any(k in c.lower() for k in ('product','item','sku','code'))), None)
 
-# 2. Bersihkan data GRN
-# Pastikan kolom referensi di PR juga dibersihkan
-df_si_f['so_transaction_number'] = df_si_f['so_transaction_number'].astype(str).str.strip().str.upper()
-df_si_f['product_id'] = df_si_f['product_id'].astype(str).str.strip().str.upper()
-df_si_f['quantity'] = pd.to_numeric(df_si_f['quantity'], errors='coerce').fillna(0)
-# 2. Grouping SO: Ambil detail unik per item per transaksi
-df_do_grouped = df_do_f.groupby(['transaction_number', 'product_id'], as_index=False).agg({
-    'item_name': 'first',      # Mengambil nama item
-    'price': 'first',
-    'quantity': 'sum',
-    'discount': 'sum',
-    'tax1_percentage': 'first',
-    'tax2_percentage': 'first',
-})
+if txn_col and txn_col != 'transaction_number':
+    df_do_f = df_do_f.rename(columns={txn_col: 'transaction_number'})
+if prod_col and prod_col != 'product_id':
+    df_do_f = df_do_f.rename(columns={prod_col: 'product_id'})
 
-# 3. Grouping PR: Agregasi sisa quantity (PENTING: Harus unik per SO + Product)
-df_si_grouped_clean = df_si_f.groupby(['do_transaction_number', 'product_id'], as_index=False).agg({
-    'transaction_number' : 'first',
-    'quantity': 'sum'
-})
+if 'transaction_number' in df_do_f.columns:
+    df_do_f['transaction_number'] = df_do_f['transaction_number'].astype(str).str.strip().str.upper()
+if 'product_id' in df_do_f.columns:
+    df_do_f['product_id'] = df_do_f['product_id'].astype(str).str.strip().str.upper()
+
+# Clean SI safely
+if 'so_transaction_number' not in df_si_f.columns:
+    alt = _find_col_by_alternatives(df_si_f, ['so_transaction_number', 'so_transaction_no', 'so_transaction', 'transaction_number'])
+    if alt:
+        df_si_f = df_si_f.rename(columns={alt: 'so_transaction_number'})
+if 'so_transaction_number' in df_si_f.columns:
+    df_si_f['so_transaction_number'] = df_si_f['so_transaction_number'].astype(str).str.strip().str.upper()
+if 'product_id' in df_si_f.columns:
+    df_si_f['product_id'] = df_si_f['product_id'].astype(str).str.strip().str.upper()
+if 'quantity' in df_si_f.columns:
+    df_si_f['quantity'] = pd.to_numeric(df_si_f['quantity'], errors='coerce').fillna(0)
+
+# Group DO if possible
+if 'transaction_number' in df_do_f.columns and 'product_id' in df_do_f.columns:
+    df_do_grouped = df_do_f.groupby(['transaction_number', 'product_id'], as_index=False).agg({
+        'item_name': 'first',      # Mengambil nama item
+        'price': 'first',
+        'quantity': 'sum',
+        'discount': 'sum',
+        'tax1_percentage': 'first',
+        'tax2_percentage': 'first',
+    })
+else:
+    print('Warning: cannot group DO because required columns are missing. Available:', df_do_f.columns.tolist())
+    df_do_grouped = pd.DataFrame(columns=['transaction_number','product_id','item_name','price','quantity','discount','tax1_percentage','tax2_percentage'])
+
+# Group SI aggregated
+if 'do_transaction_number' in df_si_f.columns and 'product_id' in df_si_f.columns:
+    df_si_grouped_clean = df_si_f.groupby(['do_transaction_number', 'product_id'], as_index=False).agg({
+        'transaction_number' : 'first',
+        'quantity': 'sum'
+    })
+else:
+    print('Warning: cannot group SI because required columns are missing. Available:', df_si_f.columns.tolist())
+    df_si_grouped_clean = pd.DataFrame(columns=['do_transaction_number','product_id','transaction_number','quantity'])
 
 # 4. Merge
 #Hitung Sisa Qty (Net Qty)
 reconcile_do_si = df_do_grouped.merge(df_si_grouped_clean, left_on=['transaction_number', 'product_id'], 
                                      right_on=['do_transaction_number', 'product_id'], how='left', suffixes=('_do','_si'))
-reconcile_do_si['quantity_si'] = reconcile_do_si['quantity_si'].fillna(0)
+# Sanitize merged frame for safe calculations
+reconcile_do_si = sanitize_reconcile(
+    reconcile_do_si,
+    numeric_cols=['quantity_do', 'quantity_si', 'net_qty', 'price', 'discount', 'tax1_percentage', 'tax2_percentage'],
+    id_cols=['transaction_number_do', 'transaction_number_si', 'product_id', 'item_name']
+)
 reconcile_do_si['net_qty'] = (reconcile_do_si['quantity_do'] - reconcile_do_si['quantity_si']).clip(lower=0)
 
 # 4. HITUNG SALDO BERDASARKAN UNIT PRICE
@@ -807,10 +1130,7 @@ total_baris_pending = len(reconcile_do_si[reconcile_do_si['net_qty'] > 0])
 
 # 1. Ubah format item_name
 reconcile_do_si['item_name'] = reconcile_do_si['item_name'].str.replace(';', ' ', regex=False)
-# 2. Ubah tipe data ke integer untuk menghilangkan .0
-reconcile_do_si['quantity_do'] = reconcile_do_si['quantity_do'].astype(int)
-reconcile_do_si['quantity_si'] = reconcile_do_si['quantity_si'].astype(int)
-reconcile_do_si['net_qty'] = reconcile_do_si['net_qty'].astype(int)
+# quantity/net columns already coerced to int by sanitize_reconcile
 
 df_download_do = reconcile_do_si[[
     'transaction_number_do', 
@@ -845,35 +1165,49 @@ total_prospektus_si = total_do_unpr2 + open_sales_order
 #Incoming Orders
 incoming_orders = df_so_f.copy()
 # Jika 1 nomor transaksi punya banyak baris (per item)
-total_incoming_orders = incoming_orders.groupby('transaction_number')['transaction_total'].last().sum()
-#total_item_pr = df_pr_f.groupby('transaction_number')['product_id'].nunique().sum() if not df_pr_f.empty else 0
-price_qty = incoming_orders['quantity'] * incoming_orders['price']
+def safe_group_last_sum(df, group_col, value_col):
+    if df is None or (hasattr(df, 'empty') and df.empty):
+        return 0
+    if group_col not in df.columns or value_col not in df.columns:
+        print(f"Warning: cannot compute group sum because {group_col} or {value_col} missing. Available: {df.columns.tolist()}")
+        return 0
+    return df.groupby(group_col)[value_col].last().sum()
+
+total_incoming_orders = safe_group_last_sum(incoming_orders, 'transaction_number', 'transaction_total')
+price_qty = safe_col_series(incoming_orders, 'quantity') * safe_col_series(incoming_orders, 'price')
 total_incoming_orders2 = price_qty.sum()
-#Menghitung Jumlah PO yang aktif (Volume)
-total_sales_count = incoming_orders['transaction_number'].nunique()
+# Menghitung Jumlah PO yang aktif (Volume) safely
+total_sales_count = count_unique_transactions(incoming_orders)
 
 #Incoming Supply
 incoming_supply = df_grn_real.copy()
-#Jika 1 nomor transaksi punya banyak baris (per item)
-total_incoming_supply = incoming_supply.groupby('transaction_number')['transaction_total'].last().sum()
-#total_item_pr = df_pr_f.groupby('transaction_number')['product_id'].nunique().sum() if not df_pr_f.empty else 0
-price_qty = incoming_supply['quantity'] * incoming_supply['price']
+# Jika 1 nomor transaksi punya banyak baris (per item)
+total_incoming_supply = safe_group_last_sum(incoming_supply, 'transaction_number', 'transaction_total')
+price_qty = safe_col_series(incoming_supply, 'quantity') * safe_col_series(incoming_supply, 'price')
 total_incoming_supply2 = price_qty.sum()
-#Menghitung Jumlah PO yang aktif (Volume)
-total_supply_count = incoming_supply['transaction_number'].nunique()
+# Menghitung Jumlah PO yang aktif (Volume) safely
+total_supply_count = count_unique_transactions(incoming_supply)
 
 #Total Amount Due
 pr_created = df_pr_real.copy()
-Total_PR_created = pr_created.groupby('transaction_number')['transaction_total'].last().sum()
+Total_PR_created = safe_group_last_sum(pr_created, 'transaction_number', 'transaction_total')
 po_created = df_po_real.copy()
-Total_PO_created = po_created.groupby('transaction_number')['transaction_total'].last().sum()
+Total_PO_created = safe_group_last_sum(po_created, 'transaction_number', 'transaction_total')
 do_created = df_do_real.copy()
-Total_DO_created = do_created.groupby('transaction_number')['transaction_total'].last().sum()
+Total_DO_created = safe_group_last_sum(do_created, 'transaction_number', 'transaction_total')
 amount_paid = df_si_real.copy()
-#Jika 1 nomor transaksi punya banyak baris (per item)
-#total_amount_paid = amount_paid[amount_paid['status_description'].isin(['Complete'])]
-# Tambahkan nama kolom yang ingin dijumlahkan di bagian akhir
-total_amount_paid = amount_paid[amount_paid['status_description'] == 'Complete']['transaction_total'].sum()
+amount_paid = df_si_real.copy()
+# Jika ada kolom `status_description`, filter Complete; otherwise sum whatever `transaction_total` exists
+if amount_paid is None or (hasattr(amount_paid, 'empty') and amount_paid.empty):
+    total_amount_paid = 0
+else:
+    if 'status_description' in amount_paid.columns and 'transaction_total' in amount_paid.columns:
+        total_amount_paid = amount_paid[amount_paid['status_description'] == 'Complete']['transaction_total'].sum()
+    elif 'transaction_total' in amount_paid.columns:
+        total_amount_paid = amount_paid['transaction_total'].sum()
+    else:
+        print('Warning: amount_paid missing transaction_total/status_description. Available:', amount_paid.columns.tolist())
+        total_amount_paid = 0
 
 
 # --- 2. HEADER DASHBOARD ---
