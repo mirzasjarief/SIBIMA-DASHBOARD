@@ -149,22 +149,63 @@ df_grn_expanded = clean_expanded_data(df_grn_expanded)
 df_do_expanded = clean_expanded_data(df_do_expanded)
 df_si_expanded = clean_expanded_data(df_si_expanded)
 
+def clean_string_code(df, col):
+    """Khusus untuk product_id: Menjaga nol di depan, hanya hapus spasi & ubah ke uppercase."""
+    if col in df.columns:
+        return (df[col].astype(str)
+                .str.strip()
+                .str.upper()
+                .replace(['NAN', 'NONE', '', '0'], 'KOSONG'))
+    return "KOSONG"
+
+def super_clean_keys(df, col):
+    """Untuk so_transaction_number: Membersihkan format float .0 dan spasi."""
+    if col in df.columns:
+        return (pd.to_numeric(df[col], errors='coerce')
+                .fillna(0)
+                .astype(int)
+                .astype(str)
+                .str.strip()
+                .replace(['0', 'NAN', 'NONE', ''], 'KOSONG'))
+    return "KOSONG"
+
+# --- 2. PRE-PROCESSING & MAPPING AWAL ---
+# Tambahkan ini di bagian paling atas PRE-PROCESSING untuk SO
+if 'so_transaction_number' not in df_so_expanded.columns and 'transaction_number' in df_so_expanded.columns:
+    df_so_expanded['so_transaction_number'] = df_so_expanded['transaction_number']
+
+for df in [df_so_expanded, df_pr_expanded, df_po_expanded, df_do_expanded, df_grn_expanded, df_si_expanded]:
+    
+    # 1. Membersihkan product_id (Gunakan clean_string_code agar nol tidak hilang)
+    if 'product_id' in df.columns:
+        df['product_id'] = clean_string_code(df, 'product_id')
+
+    # 2. Membersihkan so_transaction_number (Gunakan super_clean_keys untuk buang .0)
+    #if 'so_transaction_number' in df.columns:
+        #df['so_transaction_number'] = super_clean_keys(df, 'so_transaction_number')
+    
+    # 3. Konversi angka-angka kalkulasi
+    for col in ['quantity', 'price', 'discount', 'tax1_percentage', 'tax2_percentage']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+
+
 # --- 1. HANDLING INPUT TANGGAL ---
-st.sidebar.header("📅 Filter Periode")
+st.sidebar.header("📅 Filter period")
 
 start_default = date(2026, 2, 1) # Diubah ke Feb agar sesuai case
 end_default = date.today()
 
 selected_date_range = st.sidebar.date_input(
-    "Pilih Rentang Tanggal:",
+    "Select Date Range:",
     value=(start_default, end_default),
     max_value=date.today()
 )
 
 # --- 2. LOGIKA KATEGORI CUSTOMER ---
-st.sidebar.header("👥 Pengelompokan Customer")
+st.sidebar.header("👥 Customer Grouping")
 category_options = ["Semua", "Consignment", "Project", "Reguler"]
-selected_category = st.sidebar.selectbox("Pilih Kategori:", category_options)
+selected_category = st.sidebar.selectbox("Select Category:", category_options)
 
 # Pastikan df_so_expanded sudah dikonversi numerik sebelum ini agar tidak error
 if not df_so_expanded.empty:
@@ -249,7 +290,7 @@ def apply_balance_filter(df, date_range, customer_filter=None):
         absolute_limit = pd.to_datetime("2026-01-01").replace(hour=0, minute=0, second=0)
         
         # 3. Filter Status yang dianggap Outstanding (Belum Selesai)
-        status_outstanding = ['In Progress', 'Approved']
+        #status_outstanding = ['In Progress', 'Approved', 'Need Aprove', 'Draft', 'C']
         
         # LOGIKA MASK:
         # Mask A: Data yang masuk dalam rentang filter kalender yang dipilih
@@ -258,8 +299,9 @@ def apply_balance_filter(df, date_range, customer_filter=None):
         # Mask B: Data Masa Lalu (Backlog)
         # Ambil data dari awal tahun sampai sebelum tanggal mulai, HANYA yang masih berstatus outstanding
         mask_backlog = (df['transaction_date'] >= absolute_limit) & \
-                       (df['transaction_date'] < start_dt) & \
-                       (df['status_description'].isin(status_outstanding))
+                       (df['transaction_date'] < start_dt) 
+        #& \
+                       #(df['status_description'].isin(status_outstanding))
         
         # Gabungkan: Data periode sekarang + Data hutang (outstanding) masa lalu
         df = df[mask_current | mask_backlog]
@@ -325,15 +367,20 @@ prog_do_si = (total_item_si / total_item_do * 100) if total_item_do > 0 else 0
 #PERHITUNGAN DASHBOARD
 # 1. Hitung Revenue
 revenue = df_si_real.copy()
+status_filter = ['In Progress', 'Approved', 'Draft', 'Complete']
+revenue = revenue[revenue['status_description'].isin(status_filter)]
 #revenue['harga_setelah_diskon'] = revenue['price'] - revenue['discount']
 #revenue['total_sebelum_pajak'] = revenue['harga_setelah_diskon'] * revenue['quantity']
 revenue['total_sebelum_pajak'] = (revenue['price'] * revenue['quantity']) - revenue['discount']
 revenue['total_net_revenue_row'] = revenue['total_sebelum_pajak'] + revenue['tax1_value'] + revenue['tax2_value']
 
 # Baru kemudian di-sum
-potential_revenue = revenue['total_net_revenue_row'].sum() if not revenue.empty else 0
+revenue = revenue['total_net_revenue_row'].sum() if not revenue.empty else 0
 
 # --- RECONCILE LOGIC ENHANCED (Sesuai Alur Whiteboard) ---
+status_base = ['In Progress', 'Approved']
+status_compare = ['In Progress', 'Approved', 'Draft', 'Need Approve', 'Complete']
+
 # --- FUNGSI PEMBERSIH ---
 # Tambahkan logika replace pada fungsi pembersih
 def clean_special_chars(df, col):
@@ -357,30 +404,41 @@ df_po_f['description'] = clean_newline(df_po_f, 'description')
 df_grn_f['description'] = clean_newline(df_grn_f, 'description')
 df_do_f['description'] = clean_newline(df_do_f, 'description')
 
-def super_clean_keys(df, col):
-    if col in df.columns:
-        return df[col].astype(str).str.strip().str.replace(r'\.0$', '', regex=True).str.upper().replace(['NAN', 'NONE', '0', ''], 'KOSONG')
-    return "KOSONG"
 
-# --- 2. PRE-PROCESSING & MAPPING AWAL ---
-for df in [df_so_f, df_pr_f, df_po_f, df_do_f, df_grn_f]:
-    df['product_id'] = super_clean_keys(df, 'product_id')
-    if 'so_id' in df.columns:
-        df['so_id'] = super_clean_keys(df, 'so_id')
-    
-    for col in ['quantity', 'price', 'discount', 'tax1_percentage', 'tax2_percentage']:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-
-# FIX ERROR 'so_id' di PO: Mapping ulang dari PR asli
-pr_map = df_pr_f[['transaction_number', 'product_id', 'so_id']].drop_duplicates()
+# FIX ERROR 'so_transaction_number' di PO: Mapping ulang dari PR asli
+pr_map = df_pr_f[['transaction_number', 'product_id', 'so_transaction_number']].drop_duplicates()
 df_po_f = pd.merge(df_po_f, pr_map, left_on=['pr_transaction_number', 'product_id'], right_on=['transaction_number', 'product_id'], how='left', suffixes=('', '_map'))
 
-# Pastikan kolom so_id ada di PO sebelum groupby
-if 'so_id' not in df_po_f.columns:
-    df_po_f['so_id'] = 'KOSONG'
+# Pastikan kolom so_transaction_number ada di PO sebelum groupby
+if 'so_transaction_number' not in df_po_f.columns:
+    df_po_f['so_transaction_number'] = 'KOSONG'
 else:
-    df_po_f['so_id'] = df_po_f['so_id'].fillna('KOSONG')
+    df_po_f['so_transaction_number'] = df_po_f['so_transaction_number'].fillna('KOSONG')
+
+# --- FILTER EXCLUSION (Hapus Customer Tertentu) ---
+customers_to_exclude = ['EAS GROUP']
+
+# Hapus dari data SO agar tidak muncul di dashboard/reconcile
+df_so_f = df_so_f[~df_so_f['customer_name'].astype(str).str.upper().isin([c.upper() for c in customers_to_exclude])]
+
+# Pastikan ini dilakukan sebelum Grouping GRN
+po_map = df_po_f[['transaction_number', 'product_id', 'so_transaction_number']].drop_duplicates()
+
+df_grn_f = pd.merge(
+    df_grn_f, 
+    po_map, 
+    left_on=['po_transaction_number', 'product_id'], 
+    right_on=['transaction_number', 'product_id'], 
+    how='left',
+    suffixes=('', '_map')
+    )
+
+# Pastikan kolom so_transaction_number ada di PO sebelum groupby
+if 'so_transaction_number' not in df_grn_f.columns:
+    df_grn_f['so_transaction_number'] = 'KOSONG'
+else:
+    df_grn_f['so_transaction_number'] = df_grn_f['so_transaction_number'].fillna('KOSONG')
+
 
 # --- 3. HITUNG STOK (SOH) ---
 df_grn_total = df_grn_f.groupby('product_id')['quantity'].sum().reset_index(name='total_grn')
@@ -388,239 +446,11 @@ df_do_total = df_do_f.groupby('product_id')['quantity'].sum().reset_index(name='
 df_soh = pd.merge(df_grn_total, df_do_total, on='product_id', how='left').fillna(0)
 df_soh['current_soh'] = (df_soh['total_grn'] - df_soh['total_do_global']).clip(lower=0)
 
-# --- 4. GROUPING DATA ---
-df_so_grouped = df_so_f[df_so_f['customer_name'] != 'EAS GROUP'].groupby(['so_id', 'product_id'], as_index=False).agg({
-    'transaction_number': lambda x: ', '.join(x.unique().astype(str)), 'item_name': 'first', 'customer_name': 'first',
-    'price': 'first', 'quantity': 'sum', 'discount': 'sum',
-    'tax1_percentage': 'first', 'tax2_percentage': 'first'
-}).rename(columns={'quantity': 'qty_so', 'transaction_number': 'no_so'})
+# --- LOGIKA MAPPING so_transaction_numberD KE SI ---
+# SI biasanya tidak punya so_transaction_number langsung, kita ambil dari mapping DO
+do_map = df_do_f[['transaction_number', 'product_id', 'so_transaction_number']].drop_duplicates()
 
-df_pr_grouped = df_pr_f[df_pr_f['customer_name'] != 'EAS GROUP'].groupby(['so_id', 'product_id'], as_index=False).agg({
-    'so_transaction_number': lambda x: ', '.join(x.unique().astype(str)),'transaction_number': lambda x: ', '.join(x.unique().astype(str)),  
-    'quantity': 'sum','description' : 'first'
-}).rename(columns={'transaction_number': 'no_pr', 'quantity': 'qty_pr','description' : 'description_pr'})
-
-# GRN Grouped (Barang Masuk per SO)
-df_grn_grouped = df_grn_f.groupby(['so_id', 'product_id'], as_index=False).agg({
-    'transaction_number': lambda x: ', '.join(x.unique().astype(str)), 'quantity': 'sum', 'description' : 'first'
-}).rename(columns={'transaction_number': 'no_grn', 'quantity': 'qty_grn', 'description' : 'description_grn'})
-
-# PO Grouped (Belanjaan per SO)
-df_po_grouped = df_po_f[df_po_f['customer_name'] != 'EAS GROUP'].groupby(['so_id', 'product_id'], as_index=False).agg({
-    'transaction_number': lambda x: ', '.join(x.unique().astype(str)),'quantity': 'sum','description' : 'first'
-}).rename(columns={'transaction_number': 'no_po', 'quantity': 'qty_po', 'description' : 'description_po'})
-
-df_do_grouped = df_do_f.groupby(['so_id', 'product_id'], as_index=False).agg({
-    'so_transaction_number': lambda x: ', '.join(x.unique().astype(str)),'transaction_number': lambda x: ', '.join(x.unique().astype(str)), 
-    'quantity': 'sum','description' : 'first'
-}).rename(columns={'transaction_number': 'no_do', 'quantity': 'qty_do','description' : 'description_do'})
-# --- 5. SMART MERGE FINAL (FIX TRANSACTION_NUMBER ERROR) ---
-# --- PERBAIKAN FUNGSI SMART MERGE ---
-def smart_merge_final(base_df, target_df, type_name):
-    has_id = base_df['so_id'] != 'KOSONG'
-    
-    # Identifikasi kolom yang akan diambil (termasuk description)
-    cols_to_take = ['so_id', 'product_id', f'no_{type_name}', f'qty_{type_name}']
-    if f'description_{type_name}' in target_df.columns:
-        cols_to_take.append(f'description_{type_name}')
-    
-    # Track 1: Join Berdasarkan ID
-    with_id = base_df[has_id].copy().merge(
-        target_df[cols_to_take], 
-        on=['so_id', 'product_id'], how='left'
-    )
-    
-    # Track 2: Data Tanpa ID
-    no_id = base_df[~has_id].copy()
-    no_id[f'no_{type_name}'] = np.nan
-    no_id[f'qty_{type_name}'] = 0
-    if f'description_{type_name}' in target_df.columns:
-        no_id[f'description_{type_name}'] = ""
-    
-    combined = pd.concat([with_id, no_id], ignore_index=True)
-    return combined.drop_duplicates(subset=['no_so', 'product_id'], keep='first')
-
-# --- 6. EKSEKUSI & KALKULASI RUPIAH ---
-reconcile_master = smart_merge_final(df_so_grouped, df_pr_grouped, 'pr')
-reconcile_master = smart_merge_final(reconcile_master, df_do_grouped, 'do')
-reconcile_master = pd.merge(reconcile_master, df_po_grouped, on=['so_id', 'product_id'], how='left').fillna(0)
-reconcile_master = pd.merge(reconcile_master, df_grn_grouped, on=['so_id', 'product_id'], how='left').fillna(0)
-reconcile_master = pd.merge(reconcile_master, df_soh[['product_id', 'current_soh']], on='product_id', how='left').fillna(0)
-
-# --- 6. KALKULASI LOGIKA BARU ---
-reconcile_master['qty_pr'] = reconcile_master['qty_pr'].fillna(0)
-reconcile_master['qty_do'] = reconcile_master['qty_do'].fillna(0)
-
-# A. Hitung Net Price
-reconcile_master['disc_per_unit'] = reconcile_master['discount'] / reconcile_master['qty_so'].replace(0, 1)
-reconcile_master['tax_unit'] = reconcile_master['price'] * ((reconcile_master['tax1_percentage'] + reconcile_master['tax2_percentage']) / 100)
-reconcile_master['net_price_unit'] = reconcile_master['price'] - reconcile_master['disc_per_unit'] + reconcile_master['tax_unit']
-
-# --- 4. LOGIKA DASHBOARD BALANCE ---
-reconcile_master['qty_pr'] = reconcile_master['qty_pr'].fillna(0)
-reconcile_master['qty_do'] = reconcile_master['qty_do'].fillna(0)
-reconcile_master['qty_po'] = reconcile_master['qty_po'].fillna(0)
-reconcile_master['qty_grn'] = reconcile_master['qty_grn'].fillna(0)
-
-# A. Outstanding Pesanan
-reconcile_master['qty_outstanding'] = (reconcile_master['qty_so'] - reconcile_master['qty_do']).clip(lower=0)
-
-# B. GRN BALANCE (Stok per SO yang mengendap)
-#reconcile_master['qty_grn_balance'] = (reconcile_master['qty_grn'] - reconcile_master['qty_do']).clip(lower=0)
-reconcile_master['qty_grn_balance'] = np.where(reconcile_master['so_id'] != 'KOSONG', (reconcile_master['qty_grn'] - reconcile_master['qty_do']).clip(lower=0), 0)
-reconcile_master['amt_grn_balance'] = reconcile_master['qty_grn_balance'] * reconcile_master['net_price_unit']
-
-# C. PR BALANCE (PR belum di-PO)
-reconcile_master['qty_pr_balance'] = (reconcile_master['qty_pr'] - reconcile_master['qty_po']).clip(lower=0)
-ratio_sisa_pr = reconcile_master['qty_pr_balance'] / reconcile_master['qty_pr'].replace(0, 1)
-reconcile_master['amt_pr_balance'] = (
-    (reconcile_master['price'] * reconcile_master['qty_pr_balance']) - 
-    (reconcile_master['discount'] * ratio_sisa_pr) + 
-    (reconcile_master['tax_unit'] * reconcile_master['qty_pr_balance'])
-)
-
-# D. PO BALANCE (Barang di jalan)
-reconcile_master['qty_po_balance'] = (reconcile_master['qty_po'] - reconcile_master['qty_grn']).clip(lower=0)
-ratio_sisa_po = reconcile_master['qty_po_balance'] / reconcile_master['qty_po'].replace(0, 1)
-reconcile_master['amt_po_balance'] = (
-    (reconcile_master['price'] * reconcile_master['qty_po_balance']) - 
-    (reconcile_master['discount'] * ratio_sisa_po) + 
-    (reconcile_master['tax_unit'] * reconcile_master['qty_po_balance'])
-)
-
-# E. WAITING DELIVERY & PENDING SUPPLY
-reconcile_master['qty_waiting_delivery'] = reconcile_master[['qty_outstanding', 'current_soh']].min(axis=1)
-ratio_sisa_waiting_delivery = reconcile_master['qty_waiting_delivery'] / reconcile_master['qty_so'].replace(0, 1)
-reconcile_master['amt_waiting_delivery'] = (
-    (reconcile_master['price'] * reconcile_master['qty_waiting_delivery']) - 
-    (reconcile_master['discount'] * ratio_sisa_waiting_delivery) + 
-    (reconcile_master['tax_unit'] * reconcile_master['qty_waiting_delivery'])
-)
-# Pending Supply = Total Outstanding - (Yang sudah ready di gudang) - (Yang sedang diproses PR/PO)
-reconcile_master['true_pending_qty'] = (
-    reconcile_master['qty_outstanding'] - 
-    reconcile_master['qty_waiting_delivery'] - 
-    (reconcile_master['qty_pr'] - reconcile_master['qty_do']).clip(lower=0)
-).clip(lower=0)
-
-ratio_sisa_pending_supply = reconcile_master['true_pending_qty'] / reconcile_master['qty_so'].replace(0, 1)
-reconcile_master['amt_pending_supply'] = (
-    (reconcile_master['price'] * reconcile_master['true_pending_qty']) - 
-    (reconcile_master['discount'] * ratio_sisa_pending_supply) + 
-    (reconcile_master['tax_unit'] * reconcile_master['true_pending_qty'])
-)
-
-reconcile_master['true_so_outstanding'] = (reconcile_master['qty_so'] - reconcile_master[['qty_pr', 'qty_do']].max(axis=1)).clip(lower=0)
-ratio_sisa_so = reconcile_master['true_so_outstanding'] / reconcile_master['qty_so'].replace(0, 1)
-reconcile_master['amt_so_balance'] = (
-    (reconcile_master['price'] * reconcile_master['true_so_outstanding']) - 
-    (reconcile_master['discount'] * ratio_sisa_so) + 
-    (reconcile_master['tax_unit'] * reconcile_master['true_so_outstanding'])
-)
-
-reconcile_master['true_pending_qty2'] = (
-    reconcile_master['true_so_outstanding'] - 
-    (reconcile_master['current_soh']).clip(lower=0)
-).clip(lower=0)
-
-# --- 5. AGREGASI FINAL UNTUK DASHBOARD ---
-total_so_unpr2 = reconcile_master['amt_so_balance'].sum()
-total_pr_unpr2 = reconcile_master['amt_pr_balance'].sum()
-total_po_unpr2 = reconcile_master['amt_po_balance'].sum()
-so_pending_supply = reconcile_master['amt_pending_supply'].sum()
-so_waiting_delivery = reconcile_master['amt_waiting_delivery'].sum()
-total_grn_unpr2 = reconcile_master['amt_grn_balance'].sum()
-
-# --- 8. PREPARASI SEMUA DATAFRAME DOWNLOAD ---
-
-# 1. DOWNLOAD SO PENDING SUPPLY (Barang yang belum ada Stok & belum ada PR)
-df_download_so = reconcile_master[reconcile_master['true_so_outstanding'] > 0][[
-    'no_so', 'customer_name', 'product_id', 'item_name', 'price', 
-    'qty_so', 'qty_do', 'qty_pr', 'current_soh', 'true_pending_qty2','amt_so_balance'
-]].copy()
-
-df_download_so.columns = [
-    'No. SO', 'Customer', 'ID Produk', 'Nama Barang', 'Harga Satuan',
-    'Qty Order', 'Qty Terkirim', 'Qty Sudah PR', 'Stok Gudang', 'Qty Harus Belanja', 'Amount'
-]
-
-df_download_so_pending_supply = reconcile_master[reconcile_master['true_so_outstanding'] > 0][[
-    'no_so', 'customer_name', 'product_id', 'item_name', 'price', 
-    'qty_so', 'qty_do', 'qty_pr', 'current_soh', 'true_pending_qty'
-]].copy()
-
-df_download_so_pending_supply.columns = [
-    'No. SO', 'Customer', 'ID Produk', 'Nama Barang', 'Harga Satuan',
-    'Qty Order', 'Qty Terkirim', 'Qty Sudah PR', 'Stok Gudang', 'Qty Harus Belanja'
-]
-
-# 2. DOWNLOAD PR BALANCE (PR yang sudah dibuat tapi belum jadi PO)
-df_download_pr = reconcile_master[reconcile_master['qty_pr_balance'] > 0][[
-    'no_so', 'no_pr', 'description_pr', 'customer_name', 'product_id', 'item_name', 
-    'qty_pr', 'qty_po', 'qty_pr_balance','amt_pr_balance'
-]].copy()
-
-df_download_pr.columns = [
-    'No. SO', 'No. PR', 'Description PR', 'Customer', 'ID Produk', 'Nama Barang',
-    'Qty Permintaan (PR)', 'Qty Sudah PO', 'Qty Outstanding PR (to PO)','Nominal'
-]
-
-# 3. DOWNLOAD PO BALANCE (PO yang sudah dibuat tapi barang belum sampai/GRN)
-df_download_po = reconcile_master[reconcile_master['qty_po_balance'] > 0][[
-    'no_so', 'no_po', 'description_po', 'customer_name', 'product_id', 'item_name', 
-    'qty_po', 'qty_grn', 'qty_po_balance', 'amt_po_balance'
-]].copy()
-
-df_download_po.columns = [
-    'No. SO', 'No. PO', 'Description PO', 'Customer', 'ID Produk', 'Nama Barang',
-    'Qty Belanja (PO)', 'Qty Sudah Masuk (GRN)', 'Qty Outstanding PO (Barang belum di-GRN)','Nominal'
-]
-
-# 4. DOWNLOAD GRN BALANCE (Barang sudah di gudang tapi belum dikirim/DO)
-df_download_grn = reconcile_master[reconcile_master['qty_grn_balance'] > 0][[
-    'no_so', 'no_po', 'no_grn', 'description_grn', 'customer_name', 'product_id', 'item_name', 
-    'qty_grn', 'qty_do', 'qty_grn_balance', 'amt_grn_balance'
-]].copy()
-
-df_download_grn.columns = [
-    'No. SO', 'No. PO', 'No. GRN', 'Description GRN', 'Customer', 'ID Produk', 'Nama Barang',
-    'Qty Masuk (GRN)', 'Qty Keluar (DO)', 'Qty Outstanding', 'Nominal'
-]
-
-# 5. DOWNLOAD SO WAITING DELIVERY (Total sisa SO yang siap dikirim berdasarkan Stok Fisik)
-df_download_waiting_delivery = reconcile_master[reconcile_master['qty_waiting_delivery'] > 0][[
-    'no_so', 'customer_name', 'product_id', 'item_name', 
-    'qty_so', 'qty_do', 'current_soh', 'qty_waiting_delivery'
-]].copy()
-
-df_download_waiting_delivery.columns = [
-    'No. SO', 'Customer', 'ID Produk', 'Nama Barang', 
-    'Qty Order', 'Qty Terkirim', 'Total Stok Gudang', 'Qty Siap Kirim'
-]
-
-# --- 9. FORMATTING AKHIR (Membersihkan desimal menjadi Integer) ---
-all_downloads = [
-    df_download_so, 
-    df_download_pr, 
-    df_download_po, 
-    df_download_grn, 
-    df_download_waiting_delivery
-]
-
-for df_dl in all_downloads:
-    # Mengubah semua kolom numerik menjadi integer agar bersih saat di-download
-    num_cols = df_dl.select_dtypes(include=['number']).columns
-    df_dl[num_cols] = df_dl[num_cols].fillna(0).astype(int)
-
-
-#DO vs SI
-# --- 1. MAPPING SO_ID KE DATA SI ---
-# Karena SI biasanya tidak punya so_id, kita ambil dari mapping DO
-# transaction_number di sini adalah No DO
-do_map = df_do_f[['transaction_number', 'product_id', 'so_id']].drop_duplicates()
-
-# Gabungkan ke data SI (Invoice)
-# Ganti 'delivery_order_number' dengan nama kolom No DO yang ada di file Invoice
+# Pastikan menggunakan nama kolom yang benar di file SI (biasanya do_transaction_number)
 df_si_f = pd.merge(
     df_si_f, 
     do_map, 
@@ -629,42 +459,220 @@ df_si_f = pd.merge(
     how='left'
 ).drop(columns=['transaction_number_y'], errors='ignore')
 
-# --- 2. PRE-PROCESSING (Pembersihan ulang setelah merge) ---
-df_si_f['so_id'] = super_clean_keys(df_si_f, 'so_id')
-df_si_f['product_id'] = super_clean_keys(df_si_f, 'product_id')
+# Ambil kolom so_transaction_number hasil merge, jika tidak ada (NaN) isi KOSONG
+if 'so_transaction_number' in df_si_f.columns:
+    df_si_f['so_transaction_number'] = df_si_f['so_transaction_number'].fillna('KOSONG')
+else:
+    df_si_f['so_transaction_number'] = 'KOSONG'
 
-# --- 3. GROUPING DATA SI (Disesuaikan dengan kolom yang ada) ---
+# --- 4. EKSEKUSI FILTER STATUS ---
+# --- SO (Selalu sebagai Base) ---
+df_so_base = df_so_f[df_so_f['status_description'].isin(status_base)].copy()
 
-df_si_grouped = df_si_f.groupby(['so_id', 'product_id'], as_index=False).agg({
-    #'transaction_number': lambda x: ', '.join(x.unique().astype(str)), 
-    'do_transaction_number': lambda x: ', '.join(x.unique().astype(str)),# GANTI ke nama kolom No Invoice
-    'quantity': 'sum'
-}).rename(columns={'transaction_number': 'no_si', 'quantity': 'qty_si'})
+# --- PR ---
+df_pr_base = df_pr_f[df_pr_f['status_description'].isin(status_base)].copy() # Untuk hitung PR Balance
+df_pr_comp = df_pr_f[df_pr_f['status_description'].isin(status_compare)].copy() # Untuk pengurang SO Balance
 
-# --- 4. MERGE KE MASTER RECONCILE ---
-reconcile_master = pd.merge(reconcile_master, df_si_grouped, on=['so_id', 'product_id'], how='left').fillna(0)
+# --- PO ---
+df_po_base = df_po_f[df_po_f['status_description'].isin(status_base)].copy() # Untuk hitung PO Balance
+df_po_comp = df_po_f[df_po_f['status_description'].isin(status_compare)].copy() # Untuk pengurang PR Balance
 
-# --- 5. HITUNG SI BALANCE (Prospektus SI) ---
-reconcile_master['qty_do_balance'] = (reconcile_master['qty_do'] - reconcile_master['qty_si']).clip(lower=0)
-ratio_sisa_do = reconcile_master['qty_do_balance'] / reconcile_master['qty_do'].replace(0, 1)
-reconcile_master['amt_do_balance'] = (
-    (reconcile_master['price'] * reconcile_master['qty_do_balance']) - 
-    (reconcile_master['discount'] * ratio_sisa_do) + 
-    (reconcile_master['tax_unit'] * reconcile_master['qty_do_balance'])
-)
+# --- GRN ---
+df_grn_base = df_grn_f[df_grn_f['status_description'].isin(status_base)].copy() # Untuk hitung GRN Balance
+df_grn_comp = df_grn_f[df_grn_f['status_description'].isin(status_compare)].copy() # Untuk pengurang PO Balance
+
+# --- DO ---
+df_do_base = df_do_f[df_do_f['status_description'].isin(status_base)].copy() # Untuk hitung DO Balance
+df_do_comp = df_do_f[df_do_f['status_description'].isin(status_compare)].copy() # Untuk pengurang GRN Balance
+
+# --- SI (Selalu sebagai Compare) ---
+df_si_comp = df_si_f[df_si_f['status_description'].isin(status_compare)].copy()
+
+# --- 4. GROUPING DATA ---
+def get_grouped(df, qty_col_name):
+    # Cek apakah kolom yang dibutuhkan ada
+    if 'so_transaction_number' not in df.columns or 'product_id' not in df.columns:
+        # Jika kolom tidak ada, kembalikan DF kosong dengan struktur yang benar agar merge tidak error
+        return pd.DataFrame(columns=['so_transaction_number', 'product_id', qty_col_name])
+    
+    if df.empty: 
+        return pd.DataFrame(columns=['so_transaction_number', 'product_id', qty_col_name])
+        
+    agg_dict = {'quantity': 'sum'}
+    if 'transaction_number' in df.columns: agg_dict['transaction_number'] = lambda x: ', '.join(x.unique().astype(str))
+    if 'description' in df.columns: agg_dict['description'] = 'first'
+    if 'status_description' in df.columns: agg_dict['status_description'] = 'first'
+    
+    return df.groupby(['so_transaction_number', 'product_id'], as_index=False).agg(agg_dict).rename(columns={'quantity': qty_col_name})
+
+# Grouping Base (Untuk Header/Saldo Utama)
+so_g = df_so_base.groupby(['so_transaction_number', 'product_id'], as_index=False).agg({
+    'quantity': 'sum', 'price': 'first', 'discount': 'sum', 'tax1_percentage': 'first', 
+    'tax2_percentage': 'first', 'item_name': 'first', 'customer_name': 'first', 'transaction_number': 'first', 'status_description': 'first'
+}).rename(columns={'quantity': 'qty_so', 'transaction_number': 'no_so', 'status_description': 'stat_desc_so'})
+
+pr_base_g = get_grouped(df_pr_base, 'qty_pr_base').rename(columns={'transaction_number': 'no_pr', 'description': 'desc_pr', 'status_description': 'stat_desc_pr'})
+po_base_g = get_grouped(df_po_base, 'qty_po_base').rename(columns={'transaction_number': 'no_po', 'description': 'desc_po', 'status_description': 'stat_desc_po'})
+grn_base_g = get_grouped(df_grn_base, 'qty_grn_base').rename(columns={'transaction_number': 'no_grn', 'description': 'desc_grn', 'status_description': 'stat_desc_grn'})
+do_base_g = get_grouped(df_do_base, 'qty_do_base').rename(columns={'transaction_number': 'no_do', 'description': 'desc_do', 'status_description': 'stat_desc_do'})
+
+# Grouping Compare (Hanya ambil Qty-nya saja untuk pengurang)
+pr_comp_g = get_grouped(df_pr_comp, 'qty_pr_comp')[['so_transaction_number', 'product_id', 'qty_pr_comp']]
+po_comp_g = get_grouped(df_po_comp, 'qty_po_comp')[['so_transaction_number', 'product_id', 'qty_po_comp']]
+grn_comp_g = get_grouped(df_grn_comp, 'qty_grn_comp')[['so_transaction_number', 'product_id', 'qty_grn_comp']]
+do_comp_g = get_grouped(df_do_comp, 'qty_do_comp')[['so_transaction_number', 'product_id', 'qty_do_comp']]
+si_comp_g = get_grouped(df_si_comp, 'qty_si_comp')[['so_transaction_number', 'product_id', 'qty_si_comp']]
+
+# --- 6. MERGE SEMUA KE MASTER ---
+reconcile_master = so_g.copy()
+for other_df in [pr_base_g, pr_comp_g, po_base_g, po_comp_g, grn_base_g, grn_comp_g, do_base_g, do_comp_g, si_comp_g]:
+    reconcile_master = pd.merge(reconcile_master, other_df, on=['so_transaction_number', 'product_id'], how='left').fillna(0)
+
+# Tambahkan stok gudang (SOH) ke master berdasarkan product_id
+reconcile_master = pd.merge(reconcile_master, df_soh[['product_id', 'current_soh']], on='product_id', how='left').fillna(0)
+
+# --- 6. KALKULASI LOGIKA BARU ---
+reconcile_master['qty_pr_comp'] = reconcile_master['qty_pr_comp'].fillna(0)
+reconcile_master['qty_do_comp'] = reconcile_master['qty_do_comp'].fillna(0)
+reconcile_master['qty_po_comp'] = reconcile_master['qty_po_comp'].fillna(0)
+reconcile_master['qty_grn_comp'] = reconcile_master['qty_grn_comp'].fillna(0)
+
+# A. Hitung Nilai Per Unit yang Akurat
+# Kita hitung Pajak per unit berdasarkan (Harga - Diskon per unit)
+reconcile_master['disc_per_unit'] = reconcile_master['discount'] / reconcile_master['qty_so'].replace(0, 1)
+
+# Rumus Pajak: (Price - Disc) * Tax%
+reconcile_master['tax_unit'] = (reconcile_master['price'] - reconcile_master['disc_per_unit']) * \
+                               ((reconcile_master['tax1_percentage'] + reconcile_master['tax2_percentage']) / 100)
+
+# Net Price Unit adalah harga yang sudah bersih (Price - Disc + Tax)
+reconcile_master['net_price_unit'] = reconcile_master['price'] - reconcile_master['disc_per_unit'] + reconcile_master['tax_unit']
 
 
-# Update Variabel Dashboard
+# --- 4. LOGIKA DASHBOARD BALANCE ---
+
+# Outstanding Pesanan
+reconcile_master['qty_outstanding'] = (reconcile_master['qty_so'] - reconcile_master['qty_do_comp']).clip(lower=0)
+
+# A. SO BALANCE (Barang belum diminta atau belum dikirim)
+reconcile_master['true_so_outstanding'] = (reconcile_master['qty_so'] - reconcile_master[['qty_pr_comp', 'qty_do_comp']].max(axis=1)).clip(lower=0)
+reconcile_master['amt_so_balance'] = reconcile_master['true_so_outstanding'] * reconcile_master['net_price_unit']
+
+reconcile_master['qty_waiting_delivery'] = reconcile_master[['true_so_outstanding', 'current_soh']].min(axis=1)
+
+reconcile_master['true_pending_qty2'] = (
+    reconcile_master['true_so_outstanding'] - 
+    (reconcile_master['current_soh']).clip(lower=0)
+).clip(lower=0)
+
+# B. PR BALANCE (PR belum di-PO)
+reconcile_master['qty_pr_balance'] = (reconcile_master['qty_pr_base'] - reconcile_master['qty_po_comp']).clip(lower=0)
+reconcile_master['amt_pr_balance'] = reconcile_master['qty_pr_balance'] * reconcile_master['net_price_unit']
+
+# C. PO BALANCE (Barang di jalan)
+reconcile_master['qty_po_balance'] = (reconcile_master['qty_po_base'] - reconcile_master['qty_grn_comp']).clip(lower=0)
+reconcile_master['amt_po_balance'] = reconcile_master['qty_po_balance'] * reconcile_master['net_price_unit']
+
+# D. GRN BALANCE (Stok per SO yang mengendap)
+#reconcile_master['qty_grn_balance'] = (reconcile_master['qty_grn'] - reconcile_master['qty_do']).clip(lower=0)
+# Versi Benar:
+reconcile_master['qty_grn_balance'] = (reconcile_master['qty_grn_base'] - reconcile_master['qty_do_comp']).clip(lower=0)
+reconcile_master['amt_grn_balance'] = reconcile_master['qty_grn_balance'] * reconcile_master['net_price_unit']
+
+# E. DO BALANCE (Stok per SO yang mengendap)
+#reconcile_master['qty_grn_balance'] = (reconcile_master['qty_grn'] - reconcile_master['qty_do']).clip(lower=0)
+reconcile_master['qty_do_balance'] = (reconcile_master['qty_do_base'] - reconcile_master['qty_si_comp']).clip(lower=0)
+reconcile_master['amt_do_balance'] = reconcile_master['qty_do_balance'] * reconcile_master['net_price_unit']
+
+# --- 5. AGREGASI FINAL UNTUK DASHBOARD ---
+total_so_unpr2 = reconcile_master['amt_so_balance'].sum()
+total_pr_unpr2 = reconcile_master['amt_pr_balance'].sum()
+total_po_unpr2 = reconcile_master['amt_po_balance'].sum()
+total_grn_unpr2 = reconcile_master['amt_grn_balance'].sum()
 total_do_unpr2 = reconcile_master['amt_do_balance'].sum()
+
+# --- 6. PREPARASI SEMUA DATAFRAME DOWNLOAD ---
+
+# 1. DOWNLOAD SO PENDING SUPPLY (Barang yang belum ada Stok & belum ada PR)
+df_download_so = reconcile_master[reconcile_master['true_so_outstanding'] > 0][[
+    'no_so', 'stat_desc_so', 'customer_name', 'product_id', 'item_name', 'price', 
+    'qty_so', 'qty_do_comp', 'qty_pr_comp', 'current_soh', 'true_pending_qty2','qty_waiting_delivery','amt_so_balance'
+]].copy()
+
+df_download_so.columns = [
+    'No. SO', 'Status SO', 'Customer', 'ID Produk', 'Nama Barang', 'Harga Satuan',
+    'Qty Order', 'Qty Terkirim', 'Qty Sudah PR', 'Stok Gudang', 'Qty Harus Belanja','Qty Harus Dikirim', 'Amount'
+]
+
+# 2. DOWNLOAD PR BALANCE (PR yang sudah dibuat tapi belum jadi PO)
+df_download_pr = reconcile_master[reconcile_master['qty_pr_balance'] > 0][[
+    'no_so', 'no_pr', 'stat_desc_pr', 'desc_pr', 'customer_name', 'product_id', 'item_name', 'price',
+    'qty_pr_base', 'qty_po_comp', 'qty_pr_balance','amt_pr_balance'
+]].copy()
+
+df_download_pr.columns = [
+    'No. SO', 'No. PR', 'Status PR', 'Description PR', 'Customer', 'ID Produk', 'Nama Barang', 'Harga Jual',
+    'Qty Permintaan (PR)', 'Qty Sudah PO', 'Qty Outstanding PR (to PO)','Nominal'
+]
+
+# 3. DOWNLOAD PO BALANCE (PO yang sudah dibuat tapi barang belum sampai/GRN)
+df_download_po = reconcile_master[reconcile_master['qty_po_balance'] > 0][[
+    'no_so', 'no_po', 'stat_desc_po', 'desc_po', 'customer_name', 'product_id', 'item_name', 
+    'qty_po_base', 'qty_grn_comp', 'qty_po_balance', 'amt_po_balance'
+]].copy()
+
+df_download_po.columns = [
+    'No. SO', 'No. PO', 'Status PO', 'Description PO', 'Customer', 'ID Produk', 'Nama Barang',
+    'Qty Belanja (PO)', 'Qty Sudah Masuk (GRN)', 'Qty Outstanding PO (Barang belum di-GRN)','Nominal'
+]
+
+# 4. DOWNLOAD GRN BALANCE (Barang sudah di gudang tapi belum dikirim/DO)
+df_download_grn = reconcile_master[reconcile_master['qty_grn_balance'] > 0][[
+    'no_so', 'no_po', 'no_grn', 'stat_desc_grn', 'desc_grn', 'customer_name', 'product_id', 'item_name', 
+    'qty_grn_base', 'qty_do_comp', 'qty_grn_balance', 'amt_grn_balance'
+]].copy()
+
+df_download_grn.columns = [
+    'No. SO', 'No. PO', 'No. GRN', 'Status GRN', 'Description GRN', 'Customer', 'ID Produk', 'Nama Barang',
+    'Qty Masuk (GRN)', 'Qty Keluar (DO)', 'Qty Outstanding', 'Nominal'
+]
+
+
+# --- 7. FORMATTING AKHIR (Membersihkan desimal menjadi Integer) ---
+all_downloads = [
+    df_download_so, 
+    df_download_pr, 
+    df_download_po, 
+    df_download_grn
+]
+
+# --- 7. FORMATTING AKHIR (REVISED) ---
+for df_dl in all_downloads:
+    # Ambil kolom numerik
+    num_cols = df_dl.select_dtypes(include=['number']).columns
+    
+    # DAFTAR KOLOM YANG HARUS TETAP STRING (KECUALIKAN DARI INTEGER)
+    exclude_cols = ['ID Produk', 'SO. Id', 'ID Produk']
+    
+    # Filter kolom: hanya konversi jika kolom tersebut tidak ada dalam exclude_cols
+    cols_to_convert = [c for c in num_cols if c not in exclude_cols]
+    
+    # Jalankan konversi hanya untuk kolom qty dan nominal
+    df_dl[cols_to_convert] = df_dl[cols_to_convert].fillna(0).astype(int)
+    
+    # Pastikan ID Produk tetap string
+    if 'ID Produk' in df_dl.columns:
+        df_dl['ID Produk'] = df_dl['ID Produk'].astype(str)
+
 
 # DOWNLOAD SI BALANCE (DO Belum Invoice)
 df_download_do = reconcile_master[reconcile_master['qty_do_balance'] > 0][[
-    'no_so', 'no_po', 'description_po', 'no_do', 'description_do', 'customer_name', 'product_id', 'item_name', 
-    'qty_do', 'qty_si', 'qty_do_balance','amt_do_balance'
+    'no_so', 'no_po', 'stat_desc_do' , 'desc_po', 'no_do', 'desc_do', 'customer_name', 'product_id', 'item_name', 
+    'qty_do_base', 'qty_si_comp', 'qty_do_balance','amt_do_balance'
 ]].copy()
 
 df_download_do.columns = [
-    'No. SO', 'No. PO', 'Description PO', 'No. DO', 'Description DO', 'Customer', 'ID Produk', 'Nama Barang',
+    'No. SO', 'No. PO', 'Status DO', 'Description PO', 'No. DO', 'Description DO', 'Customer', 'ID Produk', 'Nama Barang',
     'Qty Terkirim (DO)', 'Qty Ditagihkan (SI)', 'Qty Outstanding SI', 'Nominal'
 ]
 
@@ -672,8 +680,25 @@ df_download_do.columns = [
 df_download_do[df_download_do.select_dtypes(include=['number']).columns] = df_download_do.select_dtypes(include=['number']).fillna(0).astype(int)
 
 
-open_sales_order = total_so_unpr2
-total_prospektus_si = total_so_unpr2 + total_pr_unpr2 + total_po_unpr2 + total_grn_unpr2 + total_do_unpr2
+#Menghitung Open Sales Order
+sales_order = df_so_f.copy()
+#Tambahkan Filter Status (In Progress, Draft, Approved)
+status_filter = ['In Progress', 'Approved', 'Draft']
+sales_order = sales_order[sales_order['status_description'].isin(status_filter)]
+# Kita hitung Pajak per unit berdasarkan (Harga - Diskon per unit)
+sales_order['disc_per_unit'] = sales_order['discount'] / sales_order['quantity'].replace(0, 1)
+
+# Rumus Pajak: (Price - Disc) * Tax%
+sales_order['tax_unit'] = (sales_order['price'] - sales_order['disc_per_unit']) * \
+                               ((sales_order['tax1_percentage'] + sales_order['tax2_percentage']) / 100)
+
+# Net Price Unit adalah harga yang sudah bersih (Price - Disc + Tax)
+sales_order['net_price_unit'] = sales_order['price'] - sales_order['disc_per_unit'] + sales_order['tax_unit']
+sales_order['open_sales_order'] = sales_order['quantity'] * reconcile_master['net_price_unit']
+
+open_sales_order = sales_order['open_sales_order'].sum()
+potential_revenue = total_so_unpr2 + total_pr_unpr2 + total_po_unpr2 + total_grn_unpr2 + total_do_unpr2
+total_prospektus_si = potential_revenue + revenue
 
 
 #Realization
@@ -729,7 +754,7 @@ st.markdown("""
     <style>
     /* Mengecilkan ukuran angka pada metric */
     [data-testid="stMetricValue"] {
-        font-size: 1.5rem !important; 
+        font-size: 1.4rem !important; 
         font-weight: 600;
     }
     /* Mengecilkan ukuran label (judul) pada metric */
@@ -745,11 +770,12 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 # --- UI METRICS ---
-st.subheader("💰 Ringkasan Performa Penjualan")
-c1, c2, c3 = st.columns(3)
-c1.metric("Potential Revenue", f"Rp {potential_revenue:,.0f}")
-c2.metric("Open Sales Order", f"Rp {open_sales_order:,.0f}")
-c3.metric("Margin", f"Rp")
+st.subheader("💰 Sales Performance Summary")
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Revenue", f"Rp {revenue:,.0f}")
+c2.metric("Potential Revenue", f"Rp {potential_revenue:,.0f}")
+c3.metric("Open Sales Order", f"Rp {open_sales_order:,.0f}")
+c4.metric("Margin", f"Rp")
 
 st.subheader("Balance")
 b = st.columns(3)
