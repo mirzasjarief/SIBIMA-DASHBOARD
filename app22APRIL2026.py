@@ -10,6 +10,7 @@ import streamlit as st
 from datetime import datetime, date
 from PIL import Image
 import csv
+import re
 
 # --- CONFIGURASI PAGE (WAJIB PALING ATAS) ---
 st.set_page_config(layout="wide", page_title="SIBIMA Performance Dashboard")
@@ -35,7 +36,7 @@ timezone = pytz.timezone('Asia/Jakarta')
 now = datetime.now(timezone)
 today = now.strftime("%Y-%m-%d")
 
-TOKEN = "26e9160a4c43554d70939f336cc6067ee8b984b0c93da4a5ee016ac18ced"
+TOKEN = "ffd8d2a06bada69b5be57370d682228f08a6219313fbcdd40b39e3cbbb92"
 BASE_URL = "https://eas.sibima.id/api/"
 
 @st.cache_data(ttl=600)
@@ -211,7 +212,35 @@ df_po_expanded = df_po_expanded.rename(columns={'date': 'transaction_date'})
 # Mengubah kolom 'id' menjadi 'so_detail_id'
 df_so_expanded = df_so_expanded.rename(columns={'id': 'detail_id'})
 df_pr_expanded = df_pr_expanded.rename(columns={'id': 'detail_id'})
-df_do_expanded = df_do_expanded.rename(columns={'id': 'detail_id'})
+df_po_expanded = df_po_expanded.rename(columns={'id': 'detail_id'})
+#df_grn_expanded = df_grn_expanded.rename(columns={'id': 'detail_id'})
+#df_do_expanded = df_do_expanded.rename(columns={'id': 'detail_id'})
+# --- PRE-PROCESSING UNTUK GRN & DO ---
+if 'df_do_expanded' in locals() and not df_do_expanded.empty:
+    cols_do = df_do_expanded.columns.tolist()
+    count_do = 0
+    for i, col in enumerate(cols_do):
+        if col == 'id':
+            if count_do == 0:
+                cols_do[i] = 'do_id'       # Header ID
+                count_do += 1
+            else:
+                cols_do[i] = 'detail_id'   # Detail ID
+    df_do_expanded.columns = cols_do
+
+# --- PRE-PROCESSING UNTUK GRN ---
+if 'df_grn_expanded' in locals() and not df_grn_expanded.empty:
+    cols_grn = df_grn_expanded.columns.tolist()
+    count_grn = 0
+    for i, col in enumerate(cols_grn):
+        if col == 'id':
+            if count_grn == 0:
+                cols_grn[i] = 'grn_id'     # Header ID (Penerimaan)
+                count_grn += 1
+            else:
+                cols_grn[i] = 'detail_id'   # Detail ID
+    df_grn_expanded.columns = cols_grn
+df_si_expanded = df_si_expanded.rename(columns={'id': 'detail_id'})
 
 # --- 3. HANDLING INPUT TANGGAL ---
 st.sidebar.header("📅 Filter period")
@@ -257,6 +286,156 @@ df_grn_real = apply_realization_filter(df_grn_expanded, selected_date_range)
 df_do_real = apply_realization_filter(df_do_expanded, selected_date_range)
 df_si_real = apply_realization_filter(df_si_expanded, selected_date_range)
 df_vp_real = apply_realization_filter(df_vp_expanded, selected_date_range)
+
+
+
+# --- 5. EKSEKUSI ---
+# 1. MANIPULASI KHUSUS: List SO yang ingin dipaksa masuk ke Januari 2026
+# ANTISIPASI PR BACK DATE
+so_to_force_january = [
+    #'SIBSO26020019',
+    #'SIBSO26020023'
+    #'SO-25120223'
+]
+
+if not df_so_expanded.empty:
+    # Gunakan .isin() untuk mengecek apakah transaction_number ada di dalam list
+    mask = df_so_expanded['transaction_number'].isin(so_to_force_january)
+    
+    # Ubah tanggal semua SO yang ada di list tersebut menjadi 31 Januari 2026
+    df_so_expanded.loc[mask, 'transaction_date'] = pd.Timestamp('2026-01-31')
+
+
+# --- FORCE DATA SO & PRODUCT SPESIFIK (MULTI-DATA) ---
+
+# Definisikan mapping dalam format: {(Nomor_PR, Product_ID): Qty_Baru}
+# Anda bisa menambahkan baris sebanyak yang dibutuhkan di bawah ini
+force_so_mapping = {
+    ('SO-25120223', '0000212174'): 0,
+    ('SO-25120223', '0000717033'): 0
+}
+
+if not df_so_expanded.empty:
+    df_so_expanded = df_so_expanded.copy()
+    
+    # Pastikan tipe data kolom pendukung adalah string untuk pencocokan yang akurat
+    df_so_expanded['transaction_number'] = df_so_expanded['transaction_number'].astype(str)
+    df_so_expanded['product_id'] = df_so_expanded['product_id'].astype(str)
+
+    # Iterasi melalui mapping yang sudah dibuat
+    for (so_no, prod_id), new_qty in force_so_mapping.items():
+        # Masking gabungan Nomor PR dan Product ID
+        mask = (df_so_expanded['transaction_number'] == so_no) & \
+               (df_so_expanded['product_id'] == str(prod_id))
+        
+        if mask.any():
+            # 1. Update Quantity
+            df_so_expanded.loc[mask, 'quantity'] = new_qty
+            
+            # 2. Paksa Tanggal ke Januari (Agar lolos filter outstanding Januari)
+            df_so_expanded.loc[mask, 'transaction_date'] = pd.Timestamp('2026-01-31')
+            
+            # 3. Paksa Status ke Approved (Jika ternyata status aslinya masih Draft/Need Approve)
+            if 'status_description' in df_pr_expanded.columns:
+                df_so_expanded.loc[mask, 'status_description'] = 'Approved'
+
+
+
+# --- FORCE DATA PR & PRODUCT SPESIFIK (MULTI-DATA) ---
+
+# Definisikan mapping dalam format: {(Nomor_PR, Product_ID): Qty_Baru}
+# Anda bisa menambahkan baris sebanyak yang dibutuhkan di bawah ini
+force_mapping = {
+    ('PR-26010135', '0000212174'): 35,
+    ('PR-26010135', '0000717033'): 31
+}
+
+if not df_pr_expanded.empty:
+    df_pr_expanded = df_pr_expanded.copy()
+    
+    # Pastikan tipe data kolom pendukung adalah string untuk pencocokan yang akurat
+    df_pr_expanded['transaction_number'] = df_pr_expanded['transaction_number'].astype(str)
+    df_pr_expanded['product_id'] = df_pr_expanded['product_id'].astype(str)
+
+    # Iterasi melalui mapping yang sudah dibuat
+    for (pr_no, prod_id), new_qty in force_mapping.items():
+        # Masking gabungan Nomor PR dan Product ID
+        mask = (df_pr_expanded['transaction_number'] == pr_no) & \
+               (df_pr_expanded['product_id'] == str(prod_id))
+        
+        if mask.any():
+            # 1. Update Quantity
+            df_pr_expanded.loc[mask, 'quantity'] = new_qty
+            
+            # 2. Paksa Tanggal ke Januari (Agar lolos filter outstanding Januari)
+            df_pr_expanded.loc[mask, 'transaction_date'] = pd.Timestamp('2026-01-31')
+            
+            # 3. Paksa Status ke Approved (Jika ternyata status aslinya masih Draft/Need Approve)
+            if 'status_description' in df_pr_expanded.columns:
+                df_pr_expanded.loc[mask, 'status_description'] = 'Approved'
+
+
+# --- FORCE UPDATE DESKRIPSI SO (KOREKSI DATA) ---
+# Masukkan nomor-nomor SO yang seharusnya dianggap Konsinyasi
+so_numbers_to_fix = [
+    #'SIBSO26030272',
+    #'SO-26010043',
+    #'SO-26010183',
+    #'SO-26010233',
+    #'SIBSO26020136',
+    #'SIBSO26020153',
+    #'SIBSO26020179',
+    #'SIBSO26020180',
+    #'SIBSO26020181',
+    #'SIBSO26020183',
+    #'SIBSO26020184',
+    #'SIBSO26020185',
+    #'SIBSO26020186'
+]
+
+if not df_so_expanded.empty:
+    # 1. Buat filter/mask untuk nomor PR yang ditentukan
+    mask_so = df_so_expanded['transaction_number'].isin(so_numbers_to_fix)
+    
+    # 2. Tambahkan kata "KONSINYASI" ke dalam deskripsi yang sudah ada
+    # Menggunakan f-string atau penggabungan string agar data asli tidak hilang sepenuhnya
+    df_so_expanded.loc[mask_so, 'description'] = (
+        "KONSINYASI - " + df_so_expanded.loc[mask_so, 'description'].astype(str)
+    )
+
+print(f"Berhasil mengupdate {len(so_numbers_to_fix)} transaksi SO menjadi status KONSINYASI.")
+
+
+
+# --- FORCE UPDATE DESKRIPSI PR (KOREKSI DATA) ---
+# Masukkan nomor-nomor PR yang seharusnya dianggap Konsinyasi
+pr_numbers_to_fix = [
+    #'PR-26010055', 
+    #'PR-26010236', 
+    #'SIBPR26020018',
+    #'SIBPR26020151',
+    #'SIBPR26020174',
+    #'SIBPR26020242',
+    #'SIBPR26020244',
+    #'SIBPR26020261',
+    #'SIBPR26020250',
+    #'SIBPR26020256',
+    #'SIBPR26020253',
+    #'SIBPR26020259'
+]
+
+if not df_pr_expanded.empty:
+    # 1. Buat filter/mask untuk nomor PR yang ditentukan
+    mask_pr = df_pr_expanded['transaction_number'].isin(pr_numbers_to_fix)
+    
+    # 2. Tambahkan kata "KONSINYASI" ke dalam deskripsi yang sudah ada
+    # Menggunakan f-string atau penggabungan string agar data asli tidak hilang sepenuhnya
+    df_pr_expanded.loc[mask_pr, 'description'] = (
+        "KONSINYASI - " + df_pr_expanded.loc[mask_pr, 'description'].astype(str)
+    )
+
+print(f"Berhasil mengupdate {len(pr_numbers_to_fix)} transaksi PR menjadi status KONSINYASI.")
+
 
 def apply_cumulative_filter(df, end_date):
     """
@@ -333,32 +512,6 @@ prog_grn_do = (total_item_do / total_item_grn * 100) if total_item_grn > 0 else 
 prog_do_si = (total_item_si / total_item_do * 100) if total_item_do > 0 else 0
 
 # --- 6. PERHITUNGAN DASHBOARD ---
-# 1. Hitung Revenue
-revenue = df_si_real.copy()
-status_filter = ['In Progress', 'Approved', 'Complete', 'Draft']
-revenue = revenue[revenue['status_description'].isin(status_filter)]
-revenue['total_sebelum_pajak'] = (revenue['price'] * revenue['quantity']) - revenue['discount']
-revenue['total_net_revenue_row'] = revenue['total_sebelum_pajak'] + revenue['tax1_value'] + revenue['tax2_value']
-
-# Baru kemudian di-sum
-total_revenue = revenue['total_net_revenue_row'].sum() if not revenue.empty else 0
-
-
-# DOWNLOAD REVENUE
-#df_download_revenue = revenue[revenue['status_description'] == 'Draft'][[
-    #'transaction_number', 'transaction_date', 'due_date', 'description', 'customer_name', 'product_id', 'item_name', 'quantity', 
-    #'unit' ,'price', 'transaction_total_item', 'do_transaction_number', 'so_transaction_number']].copy()
-
-df_download_revenue = revenue[[
-    'transaction_number', 'transaction_date', 'due_date', 'description', 'customer_name', 'product_id', 'item_name', 'quantity', 
-    'unit' ,'price', 'transaction_total_item', 'do_transaction_number', 'so_transaction_number']].copy()
-
-df_download_revenue.columns = [
-    'No. Transaksi SI', 'Tanggal Transaksi', 'Tanggal Jatuh Tempo', 'Deskripsi', 'Nama Kostumer', 'ID Produk', 'Nama Barang', 'Kuantitas', 
-    'Satuan', 'Harga Satuan', 'Total Transaksi', 'No. Transaksi DO', 'No. Transaksi SO'
-]
-
-
 all_do = df_do_real.copy()
 status_filter = ['In Progress', 'Approved', 'Complete','Draft', 'Need Approve']
 all_do = all_do[all_do['status_description'].isin(status_filter)]
@@ -380,7 +533,7 @@ total_all_po = all_po['total_po'].sum() if not all_po.empty else 0
 
 
 # --- 7. RECONCILE LOGIC ENHANCED (DETAIL-ID BASED) ---
-status_base = ['In Progress', 'Approved']
+status_base = ['In Progress', 'Approved', 'Complete']
 status_compare = ['In Progress', 'Approved', 'Complete']
 
 # FUNGSI PEMBERSIH
@@ -389,10 +542,58 @@ def clean_newline(df, col):
         return df[col].astype(str).str.replace(r'[\n\r]+', ' ', regex=True).str.replace(';', ' ', regex=False).str.strip()
     return ""
 
-for df in [df_so_f, df_pr_f, df_po_f, df_grn_f, df_do_f]:
+for df in [df_so_expanded, df_so_f, df_pr_f, df_po_f, df_grn_f, df_do_f]:
     if 'description' in df.columns:
         df['description'] = clean_newline(df, 'description')
+
 df_so_f['item_name'] = clean_newline(df_so_f, 'item_name')
+df_so_expanded['item_name'] = clean_newline(df_so_expanded, 'item_name')
+
+
+# 1. Hitung Revenue
+df_si_real['item_name'] = clean_newline(df_si_real, 'item_name')
+df_si_expanded['item_name'] = clean_newline(df_si_expanded, 'item_name')
+revenue = df_si_real.copy()
+status_filter = ['In Progress', 'Approved', 'Complete', 'Draft']
+revenue = revenue[revenue['status_description'].isin(status_filter)]
+keyword_to_exclude = ['Jasa', 'Biaya', 'Admin', 'Pengiriman']
+pattern = '|'.join([re.escape(word) for word in keyword_to_exclude])
+
+# Filter Keyword Tahap  (Hanya untuk revenue) ---
+revenue_keyword = [revenue]
+processed_keyword_revenue = []
+
+for df in revenue_keyword :
+    if 'item_name' in df.columns:
+        df = df[~df['item_name'].astype(str).str.contains(pattern, case=False, na=False)]
+    processed_keyword_revenue.append(df)
+
+# PERBAIKAN: Ambil elemen pertama dari list, jangan simpan list-nya ke variabel df_so_f
+revenue = processed_keyword_revenue[0] 
+
+revenue['disc_per_unit'] = revenue['price'] * (revenue['discount'] / 100)
+revenue['tax_unit'] = (revenue['price'] - revenue['disc_per_unit']) * \
+                               ((revenue['tax1_percentage'] + revenue['tax2_percentage']) / 100)
+revenue['net_price_unit'] = revenue['price'] - revenue['disc_per_unit'] + revenue['tax_unit']
+revenue['total_net_revenue_row'] = revenue['quantity'] * revenue['net_price_unit']
+
+# Baru kemudian di-sum
+total_revenue = revenue['total_net_revenue_row'].sum() if not revenue.empty else 0
+
+
+# DOWNLOAD REVENUE
+#df_download_revenue = revenue[revenue['status_description'] == 'Draft'][[
+    #'transaction_number', 'transaction_date', 'due_date', 'description', 'customer_name', 'product_id', 'item_name', 'quantity', 
+    #'unit' ,'price', 'transaction_total_item', 'do_transaction_number', 'so_transaction_number']].copy()
+
+df_download_revenue = revenue[[
+    'transaction_number', 'transaction_date', 'due_date', 'description', 'customer_name', 'product_id', 'item_name', 'quantity', 
+    'unit' ,'price', 'transaction_total_item', 'do_transaction_number', 'so_transaction_number']].copy()
+
+df_download_revenue.columns = [
+    'No. Transaksi SI', 'Tanggal Transaksi', 'Tanggal Jatuh Tempo', 'Deskripsi', 'Nama Kostumer', 'ID Produk', 'Nama Barang', 'Qty SI', 
+    'Satuan', 'Harga Jual', 'Total Transaksi', 'No. Transaksi DO', 'No. Transaksi SO'
+]
 
 # --- 2. MAPPING ULANG (MENGGUNAKAN DETAIL_ID & SO_DETAIL_ID) ---
 
@@ -419,6 +620,10 @@ else:
 df_po_f['so_detail_id'] = pd.to_numeric(df_po_f['so_detail_id'], errors='coerce').astype('Int64')
 df_pr_f['so_detail_id'] = pd.to_numeric(df_pr_f['so_detail_id'], errors='coerce').fillna(0).astype(int)
 df_po_f['pr_detail_id'] = pd.to_numeric(df_po_f['pr_detail_id'], errors='coerce').fillna(0).astype(int)
+df_grn_f['po_detail_id'] = pd.to_numeric(df_grn_f['po_detail_id'], errors='coerce').fillna(0).astype(int)
+df_do_f['grn_detail_id'] = pd.to_numeric(df_do_f['grn_detail_id'], errors='coerce').fillna(0).astype(int)
+df_si_f['do_detail_id'] = pd.to_numeric(df_si_f['do_detail_id'], errors='coerce').fillna(0).astype(int)
+
 
 # FIX GRN: Mapping dari PO menggunakan detail_id (PO) ke po_detail_id (GRN)
 po_map = df_po_f[['detail_id', 'product_id', 'so_detail_id']].drop_duplicates()
@@ -466,27 +671,66 @@ else:
 df_si_f['so_detail_id'] = df_si_f['so_detail_id'].fillna(0)
 
 # --- 8. FILTER EXCLUSION ---
-#customers_to_exclude = ['EAS GROUP']
-#for df in [df_so_f, df_pr_f, df_po_f]:
-    #df = df[~df['customer_name'].astype(str).str.upper().isin([c.upper() for c in customers_to_exclude])]
-
 customers_to_exclude = ['EAS GROUP']
-keyword_to_exclude = 'Konsinyasi'
+keyword_to_exclude1 = ['Konsinyasi']
+keyword_to_exclude2 = ['Jasa', 'Biaya', 'Admin', 'Pengiriman']
+noso_to_exclude = ['SO-26010037']
+nopr_to_exclude = ['PR-25120251', 'PR-25120219', 'PR-25120177']
+#nopo_to_exclude = ['PO-25120225']
+nogrn_to_exclude = ['GRN-25120195', 'GRN-25120139', 'GRN-25120196', 'GRN-25120197', 'GRN-25120154', 'GRN-25120135', 'GRN-25120146', 
+                    'GRN-25120076', 'GRN-25120188', 'GRN-25120189', 'GRN-25120204', 'GRN-25120089', 'GRN-25120177']
+pattern1 = '|'.join([re.escape(word) for word in keyword_to_exclude1])
+pattern2 = '|'.join([re.escape(word) for word in keyword_to_exclude2])
 
-# Kita gunakan list comprehension atau loop untuk memperbarui dataframe asli
-processed_dfs = []
-for df in [df_so_f, df_pr_f, df_si_f]:
-    # Filter Customer
-    df = df[~df['customer_name'].astype(str).str.upper().isin([c.upper() for c in customers_to_exclude])]
-    
-    # Filter Deskripsi yang mengandung kata "Konsinyasi" (case=False agar tidak sensitif huruf besar/kecil)
+# --- TAHAP 1: Filter Customer (untuk SO, PR, DO, SI) ---
+# Kita simpan dalam list agar mudah dilooping
+#dfs_customer = [df_so_f, df_pr_f, df_grn_f, df_do_f, df_si_f]
+#for i in range(len(dfs_customer)):
+    #df = dfs_customer[i]
+    #if 'customer_name' in df.columns:
+        #dfs_customer[i] = df[~df['customer_name'].astype(str).str.upper().isin([c.upper() for c in customers_to_exclude])]
+
+# Kembalikan ke variabel asli setelah difilter
+#df_so_f, df_pr_f, df_grn_f, df_do_f, df_si_f = dfs_customer
+
+
+# --- TAHAP 2: Filter Keyword Tahap 1 (Hanya untuk SO) ---
+dfs_keyword = [df_so_f]
+processed_keyword_dfs = []
+
+for df in dfs_keyword:
     if 'description' in df.columns:
-        df = df[~df['description'].astype(str).str.contains(keyword_to_exclude, case=False, na=False)]
+        df = df[~df['description'].astype(str).str.contains(pattern1, case=False, na=False)]
+    processed_keyword_dfs.append(df)
+
+# PERBAIKAN: Ambil elemen pertama dari list, jangan simpan list-nya ke variabel df_so_f
+df_so_f = processed_keyword_dfs[0] 
+
+# --- TAHAP 2: Filter Keyword Tahap 2 (Untuk semua DF) ---
+dfs_keyword2 = [df_so_f, df_pr_f, df_po_f, df_grn_f, df_do_f, df_si_f]
+processed_keyword_dfs2 = []
+
+for df in dfs_keyword2:
+    # Sekarang df di sini pasti DataFrame, bukan list lagi
+    if 'item_name' in df.columns:
+        df = df[~df['item_name'].astype(str).str.contains(pattern2, case=False, na=False)]
     
-    processed_dfs.append(df)
+    processed_keyword_dfs2.append(df)
 
 # Kembalikan ke variabel asli
-df_so_f, df_pr_f, df_si_f = processed_dfs
+df_so_f, df_pr_f, df_po_f, df_grn_f, df_do_f, df_si_f = processed_keyword_dfs2
+
+# --- TAHAP 3: Filter No Transaksi SO ---
+#df_so_f = df_so_f[~df_so_f['transaction_number'].astype(str).str.upper().isin([c.upper() for c in noso_to_exclude])]
+
+# --- TAHAP 4: Filter No Transaksi PR ---
+df_pr_f = df_pr_f[~df_pr_f['transaction_number'].astype(str).str.upper().isin([c.upper() for c in nopr_to_exclude])]
+
+# --- TAHAP 5: Filter No Transaksi PO ---
+#df_po_f = df_po_f[~df_po_f['transaction_number'].astype(str).str.upper().isin([c.upper() for c in nopo_to_exclude])]
+
+# --- TAHAP 6: Filter No Transaksi GRN ---
+df_grn_f = df_grn_f[~df_grn_f['transaction_number'].astype(str).str.upper().isin([c.upper() for c in nogrn_to_exclude])]
 
 # --- 9. HITUNG STOK (SOH) ---
 df_grn_total = df_grn_f.groupby('product_id')['quantity'].sum().reset_index(name='total_grn')
@@ -541,7 +785,7 @@ def get_grouped(df, qty_col_name):
     agg_dict = {'quantity': 'sum'}
     # Kita hanya ambil kolom yang benar-benar ada di df
     if 'transaction_number' in df.columns: agg_dict['transaction_number'] = lambda x: ', '.join(x.unique().astype(str))
-    if 'transaction_date' in df.columns: agg_dict['transaction_date'] = 'first' 
+    if 'transaction_date' in df.columns: agg_dict['transaction_date'] = 'last' 
     if 'description' in df.columns: agg_dict['description'] = 'first'
     if 'status_description' in df.columns: agg_dict['status_description'] = 'first'
     
@@ -553,10 +797,9 @@ def get_grouped(df, qty_col_name):
 # PR Base - Hanya simpan yang diperlukan
 # Master SO (Ini satu-satunya yang boleh pegang nama 'transaction_date')
 so_g = df_so_base.groupby(['detail_id', 'product_id'], as_index=False).agg({
-    'quantity': 'sum', 'price': 'first', 'discount': 'sum', 'tax1_percentage': 'first', 
-    'tax2_percentage': 'first', 'item_id': 'first', 'item_name': 'first', 'customer_name': 'first', 
-    'transaction_number': 'first', 'status_description': 'first', 'transaction_date': 'first',
-}).rename(columns={'detail_id': 'so_detail_id', 'quantity': 'qty_so', 'transaction_number': 'no_so', 'status_description': 'stat_desc_so'})
+    'quantity': 'sum', 'item_id': 'first', 
+    'status_description': 'first', 'transaction_date': 'first',
+}).rename(columns={'detail_id': 'so_detail_id', 'quantity': 'qty_so', 'status_description': 'stat_desc_so'})
 
 
 #pr_base_g = get_grouped(df_pr_base, 'qty_pr_base').rename(
@@ -637,7 +880,21 @@ do_base_g = sync_ids(do_base_g)
 do_comp_g = sync_ids(do_comp_g)
 si_comp_g = sync_ids(si_comp_g)
 
-reconcile_master = so_g.copy()
+#Antisipasi PR Back Date
+so_master_price = df_so_expanded.groupby(['detail_id', 'product_id'], as_index=False).agg({
+    'transaction_number': 'first', 
+    'price': 'first',
+    'discount': 'first',
+    'tax1_percentage': 'first',
+    'tax2_percentage': 'first',
+    'customer_name': 'first',
+    'item_name': 'first'
+}).rename(columns={'detail_id': 'so_detail_id', 'transaction_number': 'no_so',})
+so_master_price = sync_ids(so_master_price)
+
+#reconcile_master = so_g.copy()
+# Jalankan Merge Master dimulai dari Kamus Harga, bukan so_g
+reconcile_master = pd.merge(so_master_price, so_g, on=['so_detail_id', 'product_id'], how='left')
 
 # SOH tetap merge di awal
 reconcile_master = pd.merge(reconcile_master, df_soh[['product_id', 'current_soh']], on='product_id', how='left')
@@ -691,6 +948,7 @@ reconcile_master['qty_grn_comp'] = reconcile_master['qty_grn_comp'].fillna(0)
 
 # A. Hitung Nominal Diskon per Unit
 # Jika 'discount' berisi angka 10 (untuk 10%), maka dikali dengan price
+reconcile_master['price'] = pd.to_numeric(reconcile_master['price'], errors='coerce').fillna(0)
 reconcile_master['disc_per_unit'] = reconcile_master['price'] * (reconcile_master['discount'] / 100)
 
 # 2. Hitung Nominal Pajak per Unit
@@ -700,6 +958,8 @@ reconcile_master['tax_unit'] = (reconcile_master['price'] - reconcile_master['di
 
 # 3. Hitung Net Price Unit (Harga Akhir)
 reconcile_master['net_price_unit'] = reconcile_master['price'] - reconcile_master['disc_per_unit'] + reconcile_master['tax_unit']
+
+
 
 
 # --- FIX HARGA UNTUK PR TANPA INDUK SO ---
@@ -818,11 +1078,42 @@ df_download_so.columns = [
     #'qty_pr_base', 'qty_po_comp', 'qty_pr_balance','amt_pr_balance'
 #]].copy()
 
+# 1. Ambil data mentah untuk download
 df_download_pr = reconcile_master[reconcile_master['amt_pr_balance'] > 0][[
     'no_so', 'no_pr', 'date_pr_asli', 'stat_desc_pr', 'desc_pr', 'customer_name', 'product_id', 'item_name', 'price',
     'qty_pr_base', 'qty_po_comp', 'qty_pr_balance', 'amt_pr_balance'
 ]].copy()
 
+# --- START: MANIPULASI VISUAL OUTPUT (HANYA UNTUK DOWNLOAD) ---
+# Definisikan mapping: {(No_PR, Product_ID): {kolom: nilai_baru}}
+force_output_mapping = {
+    ('PR-26010135', '0000212174'): {
+        'qty_pr_base': 19, 
+        'qty_po_comp': 3, 
+        'qty_pr_balance': 16
+    },
+    ('PR-26010135', '0000717033'): {
+        'qty_pr_base': 19, 
+        'qty_po_comp': 7, 
+        'qty_pr_balance': 12
+    }
+}
+
+# Pastikan tipe data kolom kunci adalah string agar matching
+df_download_pr['no_pr'] = df_download_pr['no_pr'].astype(str)
+df_download_pr['product_id'] = df_download_pr['product_id'].astype(str)
+
+for (pr_no, prod_id), values in force_output_mapping.items():
+    mask = (df_download_pr['no_pr'] == pr_no) & (df_download_pr['product_id'] == str(prod_id))
+    
+    if mask.any():
+        for col_name, new_val in values.items():
+            if col_name in df_download_pr.columns:
+                df_download_pr.loc[mask, col_name] = new_val
+
+# --- END: MANIPULASI VISUAL OUTPUT ---
+
+# 2. Rename kolom (Lanjutkan seperti script asli Anda)
 df_download_pr.columns = [
     'No. SO', 'No. PR', 'Tanggal Transaksi PR', 'Status PR', 'Description PR', 'Customer', 'ID Produk', 'Nama Barang', 'Harga Jual',
     'Qty Permintaan (PR)', 'Qty Sudah PO', 'Qty Outstanding PR (to PO)','Nominal'
@@ -842,13 +1133,25 @@ df_download_po.columns = [
 
 # 4. DOWNLOAD GRN BALANCE (Barang sudah di gudang tapi belum dikirim/DO)
 df_download_grn = reconcile_master[reconcile_master['amt_grn_balance'] > 0][[
-    'no_so', 'no_po', 'no_grn', 'stat_desc_grn', 'desc_grn', 'customer_name', 'product_id', 'item_name', 
+    'no_so', 'no_po', 'no_grn', 'stat_desc_grn', 'desc_grn', 'product_id', 'item_name', 'price',
     'qty_grn_base', 'qty_do_comp', 'qty_grn_balance', 'amt_grn_balance'
 ]].copy()
 
 df_download_grn.columns = [
-    'No. SO', 'No. PO', 'No. GRN', 'Status GRN', 'Description GRN', 'Customer', 'ID Produk', 'Nama Barang',
+    'No. SO', 'No. PO', 'No. GRN', 'Status GRN', 'Description GRN', 'ID Produk', 'Nama Barang', 'Harga Jual',
     'Qty Masuk (GRN)', 'Qty Keluar (DO)', 'Qty Outstanding', 'Nominal'
+]
+
+
+# DOWNLOAD SI BALANCE (DO Belum Invoice)
+df_download_do = reconcile_master[reconcile_master['amt_do_balance'] > 0][[
+    'no_so', 'no_po', 'stat_desc_do' , 'desc_po', 'no_do', 'desc_do', 'customer_name', 'product_id', 'item_name', 'price',
+    'qty_do_base', 'qty_si_comp', 'qty_do_balance','amt_do_balance'
+]].copy()
+
+df_download_do.columns = [
+    'No. SO', 'No. PO', 'Status DO', 'Description PO', 'No. DO', 'Description DO', 'Customer', 'ID Produk', 'Nama Barang', 'Harga Jual',
+    'Qty Terkirim (DO)', 'Qty Ditagihkan (SI)', 'Qty Outstanding SI', 'Nominal'
 ]
 
 
@@ -856,7 +1159,8 @@ all_downloads = [
     df_download_so, 
     df_download_pr, 
     df_download_po, 
-    df_download_grn
+    df_download_grn,
+    df_download_do,
 ]
 
 # --- 16. FORMATTING AKHIR (REVISED) ---
@@ -865,7 +1169,7 @@ for df_dl in all_downloads:
     num_cols = df_dl.select_dtypes(include=['number']).columns
     
     # DAFTAR KOLOM YANG HARUS TETAP STRING (KECUALIKAN DARI INTEGER)
-    exclude_cols = ['ID Produk', 'SO. Id', 'ID Produk']
+    exclude_cols = ['ID Produk', 'Harga Jual', 'Nominal']
     
     # Filter kolom: hanya konversi jika kolom tersebut tidak ada dalam exclude_cols
     cols_to_convert = [c for c in num_cols if c not in exclude_cols]
@@ -878,19 +1182,8 @@ for df_dl in all_downloads:
         df_dl['ID Produk'] = df_dl['ID Produk'].astype(str)
 
 
-# DOWNLOAD SI BALANCE (DO Belum Invoice)
-df_download_do = reconcile_master[reconcile_master['amt_do_balance'] > 0][[
-    'no_so', 'no_po', 'stat_desc_do' , 'desc_po', 'no_do', 'desc_do', 'customer_name', 'product_id', 'item_name', 
-    'qty_do_base', 'qty_si_comp', 'qty_do_balance','amt_do_balance'
-]].copy()
-
-df_download_do.columns = [
-    'No. SO', 'No. PO', 'Status DO', 'Description PO', 'No. DO', 'Description DO', 'Customer', 'ID Produk', 'Nama Barang',
-    'Qty Terkirim (DO)', 'Qty Ditagihkan (SI)', 'Qty Outstanding SI', 'Nominal'
-]
-
 # Formatting akhir ke Integer
-df_download_do[df_download_do.select_dtypes(include=['number']).columns] = df_download_do.select_dtypes(include=['number']).fillna(0).astype(int)
+#df_download_do[df_download_do.select_dtypes(include=['number']).columns] = df_download_do.select_dtypes(include=['number']).fillna(0).astype(int)
 
 
 #Realization
@@ -904,8 +1197,9 @@ sales_order['total_sebelum_pajak'] = (sales_order['price'] * sales_order['quanti
 sales_order['open_sales_order'] = sales_order['total_sebelum_pajak'] + sales_order['tax1_value'] + sales_order['tax2_value']
 
 open_sales_order = sales_order['open_sales_order'].sum()
-potential_revenue = total_so_unpr2 + total_pr_unpr2 + total_po_unpr2 + total_grn_unpr2 + total_do_unpr2
-total_prospektus_si = potential_revenue + total_revenue
+#potential_revenue = total_so_unpr2 + total_pr_unpr2 + total_po_unpr2 + total_grn_unpr2 + total_do_unpr2
+total_prospektus_si = total_so_unpr2 + total_pr_unpr2 + total_po_unpr2 + total_grn_unpr2 + total_do_unpr2
+#total_prospektus_si = potential_revenue + total_revenue
 
 
 #Realization
@@ -994,8 +1288,8 @@ st.markdown("""
 st.subheader("💰 Sales Performance Summary")
 c1, c2, c3 = st.columns(3)
 c1.metric("Revenue", f"Rp {total_revenue:,.0f}")
-c2.metric("Potential Revenue", f"Rp {potential_revenue:,.0f}")
-c3.metric("Open Sales Order", f"Rp {open_sales_order:,.0f}")
+c2.metric("Open Sales Order", f"Rp {open_sales_order:,.0f}")
+c3.metric("Margin", f"Rp ")
 #c4.metric("All DO", f"Rp {total_all_do:,.0f}")
 #c5.metric("All PO", f"Rp {total_all_po:,.0f}")
 
